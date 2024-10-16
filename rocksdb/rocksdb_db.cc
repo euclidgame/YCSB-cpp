@@ -8,6 +8,7 @@
 
 #include "rocksdb_db.h"
 #include <thread>
+#include <iostream>
 #include "core/core_workload.h"
 #include "core/db_factory.h"
 #include "utils/utils.h"
@@ -22,8 +23,10 @@
 #include "json.hpp"  // For handling JSON
 #include <boost/interprocess/sync/interprocess_mutex.hpp>
 #include <boost/interprocess/sync/interprocess_condition.hpp>
+#include <boost/interprocess/sync/scoped_lock.hpp>
 #include <boost/interprocess/shared_memory_object.hpp>
 #include <boost/interprocess/mapped_region.hpp>
+
 
 using json = nlohmann::json;
 using namespace boost::interprocess;
@@ -128,30 +131,31 @@ namespace ycsbc {
     ERROR      // Operation failed or encountered an issue
   };
   // Struct for handling responses for each requester
-  struct ResponseData {
-      std::mutex responseMutex;
-      std::condition_variable responseCondVar;
-      std::string resultData;      // Store the result data (e.g., value or error message)
-      ResultStatus status;         // Result status (OK or ERROR)
+struct ResponseData {
+    interprocess_mutex responseMutex;
+    interprocess_condition responseCondVar;
+    char resultData[256];  // Fixed size array to store result data
+    ResultStatus status;
 
-      ResponseData() : resultData(""), status(ResultStatus::ERROR) {}
-  };
+    ResponseData() : status(ResultStatus::ERROR) {
+        resultData[0] = '\0';  // Initialize resultData
+    }
+};
 
+// Define SharedMemoryData struct
+struct SharedMemoryData {
+    interprocess_mutex taskMutex;            // Mutex for task queue
+    interprocess_condition taskCondVar;      // Condition variable for task notification
+    boost::container::vector<std::string> tasks;  // Task queue using vector of strings
 
-  // Shared memory structure
-  struct SharedMemoryData {
-      boost::interprocess::interprocess_mutex taskMutex;             // Mutex for task queue
-      boost::interprocess::interprocess_condition taskCondVar;       // Condition variable for task notification
-      std::vector<std::string> tasks;           // Task queue using vector of strings (JSON tasks)
+    boost::container::map<std::string, ResponseData*> responseMap;  // Map to ResponseData
+    interprocess_mutex responseMutex;        // Mutex for protecting responseMap access
+    bool stopSignal;
 
-      std::map<std::string, std::unique_ptr<ResponseData>> responseMap;  // Response map
-      std::mutex responseMutex;                 // Mutex for protecting responseMap access
-      bool stopSignal;
-
-      SharedMemoryData() : stopSignal(false) {
-          tasks.reserve(100);  // Reserve space for 100 tasks initially
-      }
-  };
+    SharedMemoryData() : stopSignal(false) {
+        tasks.reserve(100);  // Reserve space for 100 tasks initially
+    }
+};
 
 std::string getCurrentThreadIdAsString() {
     std::thread::id threadId = std::this_thread::get_id();  // Get the current thread ID
@@ -164,22 +168,10 @@ std::vector<rocksdb::ColumnFamilyHandle *> RocksdbDB::cf_handles_;
 rocksdb::DB *RocksdbDB::db_ = nullptr;
 int RocksdbDB::ref_cnt_ = 0;
 std::mutex RocksdbDB::mu_;
-SharedMemoryData* sharedMemoryData;
 std::string db_path;
 
 void RocksdbDB::Init() {
 // merge operator disabled by default due to link error
-    shared_memory_object shm(open_only, "SharedMemorySegment", read_write);
-
-    // Map the whole shared memory in this process
-    mapped_region region(shm, read_write);
-
-    // Get the address of the mapped region
-    void* addr = region.get_address();
-
-    // Access the SharedMemoryData structure in this shared memory
-    sharedMemoryData = static_cast<SharedMemoryData*>(addr);
-
 
 #ifdef USE_MERGEUPDATE
   class YCSBUpdateMerge : public rocksdb::AssociativeMergeOperator {
@@ -488,42 +480,69 @@ void RocksdbDB::DeserializeRow(std::vector<Field> &values, const std::string &da
   DeserializeRow(values, p, lim);
 }
 
+ResponseData* SubmitTaskAndWaitForResponse(
+    const std::string& requesterId, 
+    const json& task) {
+
+    shared_memory_object shm(open_only, "SharedMemorySegment", read_write);
+
+    // Map the whole shared memory in this process
+    mapped_region region(shm, read_write);
+
+    // Get the address of the mapped region
+    void* addr = region.get_address();
+
+    // Access the SharedMemoryData structure in this shared memory
+    SharedMemoryData *sharedMemoryData = static_cast<SharedMemoryData*>(addr);
+    // Lock the response map and create a response object if it doesn't exist
+    {
+        boost::interprocess::scoped_lock<boost::interprocess::interprocess_mutex> mapLock(sharedMemoryData->responseMutex);
+        std::cout << &sharedMemoryData->responseMap << std::endl;
+        // Check if the response object for the requesterId exists; if not, create it
+        if (sharedMemoryData->responseMap.find(requesterId) == sharedMemoryData->responseMap.end()) {
+
+            sharedMemoryData->responseMap[requesterId] = std::make_unique<ResponseData>();
+            std::cout << "SubmitTaskAndWaitForResponse" << std::endl;
+        }
+    }
+    // Submit the task to the thread pool by adding it to the shared memory task queue
+    {
+        boost::interprocess::scoped_lock<boost::interprocess::interprocess_mutex> taskLock(sharedMemoryData->taskMutex);
+        sharedMemoryData->tasks.push_back(task.dump());
+    }
+    sharedMemoryData->taskCondVar.notify_one();  // Notify one worker thread
+
+    // Wait for the result from the worker thread (asynchronous task)
+    {
+        boost::interprocess::scoped_lock<boost::interprocess::interprocess_mutex> responseLock(sharedMemoryData->responseMap[requesterId]->responseMutex);
+        ResponseData* response = sharedMemoryData->responseMap[requesterId].get();
+
+        // Wait until the result is ready
+        response->responseCondVar.wait(responseLock, [response]() {
+            return !response->resultData.empty();  // Condition: result data is available
+        });
+
+        // Return the response object
+        return response;
+    }
+}
+
+
+
+// Example function modified for proper boost::interprocess usage
 DB::Status RocksdbDB::ReadSingle(const std::string &table, const std::string &key,
                                  const std::vector<std::string> *fields,
                                  std::vector<Field> &result) {
-
     std::string requesterId = getCurrentThreadIdAsString();
 
     // Prepare the task as a JSON object
     json task;
-    task["requesterId"] = requesterId;   // Each requester has a unique ID
-    task["operation"] = "read";          // We're performing a read operation
+    task["requesterId"] = requesterId;
+    task["operation"] = "read";
     task["key"] = key;
-    task["database"] = db_path;          // Use the database name from the global _dbName
+    task["database"] = db_path;
 
-    // Lock the response map and create a response object if it doesn't exist
-    {
-        std::lock_guard<std::mutex> mapLock(sharedMemoryData->responseMutex);  // Protect responseMap
-        if (sharedMemoryData->responseMap.find(requesterId) == sharedMemoryData->responseMap.end()) {
-            sharedMemoryData->responseMap[requesterId] = std::make_unique<ResponseData>();
-        }
-    }
-
-    // Submit the task to the thread pool by adding it to the shared memory task queue
-    {
-        std::lock_guard<interprocess_mutex> lock(sharedMemoryData->taskMutex);  // Lock task queue
-        sharedMemoryData->tasks.push_back(task.dump());  // Add the task as a serialized JSON string
-    }
-    sharedMemoryData->taskCondVar.notify_one();  // Notify one worker thread that a new task is available
-
-    // Wait for the result from the worker thread (asynchronous task)
-    std::unique_lock<std::mutex> responseLock(sharedMemoryData->responseMutex);
-    ResponseData* response = sharedMemoryData->responseMap[requesterId].get();  // Get the response object
-
-    // Wait until the result is ready
-    response->responseCondVar.wait(responseLock, [response]() {
-        return !response->resultData.empty();  // Condition: result data is available
-    });
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
     // Check result status
     if (response->status == ResultStatus::ERROR) {
@@ -547,300 +566,192 @@ DB::Status RocksdbDB::ReadSingle(const std::string &table, const std::string &ke
 DB::Status RocksdbDB::ScanSingle(const std::string &table, const std::string &key, int len,
                                  const std::vector<std::string> *fields,
                                  std::vector<std::vector<Field>> &result) {
-  // Convert thread ID to string for requesterId
-  std::string requesterId = getCurrentThreadIdAsString();
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
 
-  // Prepare the task as a JSON object
-  json task;
-  task["requesterId"] = requesterId;
-  task["operation"] = "scan";
-  task["database"] = db_path;  // Assuming _db is globally defined
-  task["key"] = key;
-  task["len"] = len;
+    // Prepare the task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "scan";
+    task["database"] = db_path;  // Assuming db_path is globally defined
+    task["key"] = key;
+    task["len"] = len;
 
-  // Push task to the shared memory task queue
-  {
-    std::lock_guard<interprocess_mutex> lock(sharedMemoryData->taskMutex);
-    sharedMemoryData->tasks.push_back(task.dump());
-  }
-  sharedMemoryData->taskCondVar.notify_one();  // Notify one worker thread
+    // Use the new generalized function to submit the task and wait for the response
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
-  // Wait for response
-  {
-    std::unique_lock<std::mutex> responseLock(sharedMemoryData->responseMutex);
-    auto &responsePtr = sharedMemoryData->responseMap[requesterId];
-    
-    if (!responsePtr) {
-      responsePtr = std::make_unique<ResponseData>();
-    }
-
-    auto &response = *responsePtr;
-    response.responseCondVar.wait(responseLock, [&response]() {
-      return response.status != ResultStatus::ERROR;  // Wait until task is processed
-    });
-
-    // Parse response
-    if (response.status == ResultStatus::OK) {
-      std::istringstream stream(response.resultData);  // Read resultData line by line
-      std::string line;
-      int count = 0;
-      while (std::getline(stream, line) && count < len) {
-        result.push_back(std::vector<Field>());
-        std::vector<Field> &values = result.back();
-        if (fields != nullptr) {
-          DeserializeRowFilter(values, line, *fields);
-        } else {
-          DeserializeRow(values, line);
-          assert(values.size() == static_cast<size_t>(fieldcount_));
+    // Parse the response
+    if (response->status == ResultStatus::OK) {
+        std::istringstream stream(response->resultData);  // Read resultData line by line
+        std::string line;
+        int count = 0;
+        while (std::getline(stream, line) && count < len) {
+            result.push_back(std::vector<Field>());
+            std::vector<Field> &values = result.back();
+            if (fields != nullptr) {
+                DeserializeRowFilter(values, line, *fields);
+            } else {
+                DeserializeRow(values, line);
+                assert(values.size() == static_cast<size_t>(fieldcount_));
+            }
+            count++;
         }
-        count++;
-      }
-      return kOK;
+        return kOK;
     } else {
-      return kNotFound;  // Handle error or not found case
+        return kNotFound;  // Handle error or not found case
     }
-  }
 }
+
 
 
 DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &key,
                                    std::vector<Field> &values) {
-  // Convert thread ID to string for requesterId
-  std::string requesterId = getCurrentThreadIdAsString();
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
 
-  // --------- Step 1: Read the existing data using thread pool ---------
-  // Prepare the read task as a JSON object
-  json readTask;
-  readTask["requesterId"] = requesterId;
-  readTask["operation"] = "read";
-  readTask["database"] = db_path;  // Assuming _db is globally defined
-  readTask["key"] = key;
+    // --------- Step 1: Read the existing data using thread pool ---------
+    // Prepare the read task as a JSON object
+    json readTask;
+    readTask["requesterId"] = requesterId;
+    readTask["operation"] = "read";
+    readTask["database"] = db_path;  // Assuming db_path is globally defined
+    readTask["key"] = key;
 
-  // Push the read task to the shared memory task queue
-  {
-    std::lock_guard<interprocess_mutex> lock(sharedMemoryData->taskMutex);
-    sharedMemoryData->tasks.push_back(readTask.dump());
-  }
-  sharedMemoryData->taskCondVar.notify_one();  // Notify one worker thread
+    // Use the new generalized function to submit the read task and wait for the response
+    ResponseData* readResponse = SubmitTaskAndWaitForResponse(requesterId, readTask);
 
-  // Wait for the read response
-  std::string existingData;
-  {
-    std::unique_lock<std::mutex> responseLock(sharedMemoryData->responseMutex);
-    auto &responsePtr = sharedMemoryData->responseMap[requesterId];
-
-    if (!responsePtr) {
-      responsePtr = std::make_unique<ResponseData>();
-    }
-
-    auto &response = *responsePtr;
-    response.responseCondVar.wait(responseLock, [&response]() {
-      return response.status != ResultStatus::ERROR;  // Wait until read task is processed
-    });
-
-    if (response.status == ResultStatus::OK) {
-      existingData = response.resultData;  // Get the existing row data
-    } else if (response.status == ResultStatus::ERROR) {
-      return kNotFound;
+    // Check if the read was successful and process the response
+    std::string existingData;
+    if (readResponse->status == ResultStatus::OK) {
+        existingData = readResponse->resultData;  // Get the existing row data
+    } else if (readResponse->status == ResultStatus::ERROR) {
+        return kNotFound;
     } else {
-      throw utils::Exception("RocksDB Read: Error occurred during read");
-    }
-  }
-
-  // --------- Step 2: Update the data ---------
-  std::vector<Field> currentValues;
-  DeserializeRow(currentValues, existingData);
-  assert(currentValues.size() == static_cast<size_t>(fieldcount_));
-
-  for (Field &newField : values) {
-    bool found MAYBE_UNUSED = false;
-    for (Field &curField : currentValues) {
-      if (curField.name == newField.name) {
-        found = true;
-        curField.value = newField.value;  // Update the field value
-        break;
-      }
-    }
-    assert(found);
-  }
-
-  // --------- Step 3: Insert the updated data using thread pool ---------
-  // Serialize the updated values
-  std::string updatedData;
-  SerializeRow(currentValues, updatedData);
-
-  // Prepare the insert task as a JSON object
-  json insertTask;
-  insertTask["requesterId"] = requesterId;
-  insertTask["operation"] = "insert";
-  insertTask["database"] = db_path;
-  insertTask["key"] = key;
-  insertTask["value"] = updatedData;
-
-  // Push the insert task to the shared memory task queue
-  {
-    std::lock_guard<interprocess_mutex> lock(sharedMemoryData->taskMutex);
-    sharedMemoryData->tasks.push_back(insertTask.dump());
-  }
-  sharedMemoryData->taskCondVar.notify_one();  // Notify one worker thread
-
-  // Wait for the insert response
-  {
-    std::unique_lock<std::mutex> responseLock(sharedMemoryData->responseMutex);
-    auto &responsePtr = sharedMemoryData->responseMap[requesterId];
-
-    if (!responsePtr) {
-      responsePtr = std::make_unique<ResponseData>();
+        throw utils::Exception("RocksDB Read: Error occurred during read");
     }
 
-    auto &response = *responsePtr;
-    response.responseCondVar.wait(responseLock, [&response]() {
-      return response.status != ResultStatus::ERROR;  // Wait until insert task is processed
-    });
+    // --------- Step 2: Update the data ---------
+    std::vector<Field> currentValues;
+    DeserializeRow(currentValues, existingData);
+    assert(currentValues.size() == static_cast<size_t>(fieldcount_));
 
-    // Check the response status
-    if (response.status == ResultStatus::OK) {
-      return kOK;
+    for (Field &newField : values) {
+        bool found MAYBE_UNUSED = false;
+        for (Field &curField : currentValues) {
+            if (curField.name == newField.name) {
+                found = true;
+                curField.value = newField.value;  // Update the field value
+                break;
+            }
+        }
+        assert(found);
+    }
+
+    // --------- Step 3: Insert the updated data using thread pool ---------
+    // Serialize the updated values
+    std::string updatedData;
+    SerializeRow(currentValues, updatedData);
+
+    // Prepare the insert task as a JSON object
+    json insertTask;
+    insertTask["requesterId"] = requesterId;
+    insertTask["operation"] = "insert";
+    insertTask["database"] = db_path;
+    insertTask["key"] = key;
+    insertTask["value"] = updatedData;
+
+    // Use the new generalized function to submit the insert task and wait for the response
+    ResponseData* insertResponse = SubmitTaskAndWaitForResponse(requesterId, insertTask);
+
+    // Check the insert response status
+    if (insertResponse->status == ResultStatus::OK) {
+        return kOK;
     } else {
-      throw utils::Exception("RocksDB Insert: Error occurred during insert");
+        throw utils::Exception("RocksDB Insert: Error occurred during insert");
     }
-  }
 }
+
 
 DB::Status RocksdbDB::MergeSingle(const std::string &table, const std::string &key,
                                   std::vector<Field> &values) {
-  // Convert thread ID to string for requesterId
-  std::string requesterId = getCurrentThreadIdAsString();
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
 
-  // Serialize the fields into a string format for merging
-  std::string data;
-  SerializeRow(values, data);
+    // Serialize the fields into a string format for merging
+    std::string data;
+    SerializeRow(values, data);
 
-  // Prepare the task as a JSON object
-  json task;
-  task["requesterId"] = requesterId;
-  task["operation"] = "merge";
-  task["database"] = db_path;  // Assuming _db is globally defined
-  task["key"] = key;
-  task["value"] = data;  // Serialized row data for merging
+    // Prepare the merge task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "merge";
+    task["database"] = db_path;  // Assuming db_path is globally defined
+    task["key"] = key;
+    task["value"] = data;  // Serialized row data for merging
 
-  // Push the task to the shared memory task queue
-  {
-    std::lock_guard<interprocess_mutex> lock(sharedMemoryData->taskMutex);
-    sharedMemoryData->tasks.push_back(task.dump());
-  }
-  sharedMemoryData->taskCondVar.notify_one();  // Notify one worker thread
+    // Use the new generalized function to submit the merge task and wait for the response
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
-  // Wait for the response
-  {
-    std::unique_lock<std::mutex> responseLock(sharedMemoryData->responseMutex);
-    auto &responsePtr = sharedMemoryData->responseMap[requesterId];
-    
-    if (!responsePtr) {
-      responsePtr = std::make_unique<ResponseData>();
-    }
-
-    auto &response = *responsePtr;
-    response.responseCondVar.wait(responseLock, [&response]() {
-      return response.status != ResultStatus::ERROR;  // Wait until task is processed
-    });
-
-    // Check the response status
-    if (response.status == ResultStatus::OK) {
-      return kOK;
+    // Check the merge response status
+    if (response->status == ResultStatus::OK) {
+        return kOK;
     } else {
-      return kNotFound;  // Handle error case
+        return kNotFound;  // Handle error case
     }
-  }
 }
+
 
 DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &key,
                                    std::vector<Field> &values) {
-  // Convert thread ID to string for requesterId
-  std::string requesterId = getCurrentThreadIdAsString();
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
 
-  // Serialize the fields into a string format for inserting
-  std::string data;
-  SerializeRow(values, data);
+    // Serialize the fields into a string format for insertion
+    std::string data;
+    SerializeRow(values, data);
 
-  // Prepare the task as a JSON object
-  json task;
-  task["requesterId"] = requesterId;
-  task["operation"] = "insert";
-  task["database"] =db_path;  // Assuming _db is globally defined
-  task["key"] = key;
-  task["value"] = data;  // Serialized row data for insertion
+    // Prepare the insert task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "insert";
+    task["database"] = db_path;  // Assuming db_path is globally defined
+    task["key"] = key;
+    task["value"] = data;  // Serialized row data for insertion
 
-  // Push the task to the shared memory task queue
-  {
-    std::lock_guard<interprocess_mutex> lock(sharedMemoryData->taskMutex);
-    sharedMemoryData->tasks.push_back(task.dump());
-  }
-  sharedMemoryData->taskCondVar.notify_one();  // Notify one worker thread
+    // Use the new generalized function to submit the insert task and wait for the response
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
-  // Wait for the response
-  {
-    std::unique_lock<std::mutex> responseLock(sharedMemoryData->responseMutex);
-    auto &responsePtr = sharedMemoryData->responseMap[requesterId];
-    
-    if (!responsePtr) {
-      responsePtr = std::make_unique<ResponseData>();
-    }
-
-    auto &response = *responsePtr;
-    response.responseCondVar.wait(responseLock, [&response]() {
-      return response.status != ResultStatus::ERROR;  // Wait until task is processed
-    });
-
-    // Check the response status
-    if (response.status == ResultStatus::OK) {
-      return kOK;
+    // Check the insert response status
+    if (response->status == ResultStatus::OK) {
+        return kOK;
     } else {
-      throw utils::Exception("RocksDB Insert: Error occurred during insertion");
+        throw utils::Exception("RocksDB Insert: Error occurred during insertion");
     }
-  }
 }
+
 
 DB::Status RocksdbDB::DeleteSingle(const std::string &table, const std::string &key) {
-  // Convert thread ID to string for requesterId
-  std::string requesterId = getCurrentThreadIdAsString();
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
 
-  // Prepare the task as a JSON object
-  json task;
-  task["requesterId"] = requesterId;
-  task["operation"] = "delete";
-  task["database"] = db_path;  // Assuming _db is globally defined
-  task["key"] = key;
+    // Prepare the delete task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "delete";
+    task["database"] = db_path;  // Assuming db_path is globally defined
+    task["key"] = key;
 
-  // Push the task to the shared memory task queue
-  {
-    std::lock_guard<interprocess_mutex> lock(sharedMemoryData->taskMutex);
-    sharedMemoryData->tasks.push_back(task.dump());
-  }
-  sharedMemoryData->taskCondVar.notify_one();  // Notify one worker thread
+    // Use the new generalized function to submit the delete task and wait for the response
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
-  // Wait for the response
-  {
-    std::unique_lock<std::mutex> responseLock(sharedMemoryData->responseMutex);
-    auto &responsePtr = sharedMemoryData->responseMap[requesterId];
-    
-    if (!responsePtr) {
-      responsePtr = std::make_unique<ResponseData>();
-    }
-
-    auto &response = *responsePtr;
-    response.responseCondVar.wait(responseLock, [&response]() {
-      return response.status != ResultStatus::ERROR;  // Wait until task is processed
-    });
-
-    // Check the response status
-    if (response.status == ResultStatus::OK) {
-      return kOK;
+    // Check the delete response status
+    if (response->status == ResultStatus::OK) {
+        return kOK;
     } else {
-      throw utils::Exception("RocksDB Delete: Error occurred during deletion");
+        throw utils::Exception("RocksDB Delete: Error occurred during deletion");
     }
-  }
 }
+
 
 DB *NewRocksdbDB() {
   return new RocksdbDB;
