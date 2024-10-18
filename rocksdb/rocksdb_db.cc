@@ -9,6 +9,7 @@
 #include "rocksdb_db.h"
 #include <thread>
 #include <iostream>
+#include <chrono>
 #include "core/core_workload.h"
 #include "core/db_factory.h"
 #include "utils/utils.h"
@@ -20,16 +21,14 @@
 #include <rocksdb/utilities/options_util.h>
 #include <rocksdb/write_batch.h>
 
+#include <boost/asio.hpp>
+#include <vector>
 #include "json.hpp"  // For handling JSON
-#include <boost/interprocess/sync/interprocess_mutex.hpp>
-#include <boost/interprocess/sync/interprocess_condition.hpp>
-#include <boost/interprocess/sync/scoped_lock.hpp>
-#include <boost/interprocess/shared_memory_object.hpp>
-#include <boost/interprocess/mapped_region.hpp>
 
+using boost::asio::ip::tcp;
+using json = nlohmann::json;
 
 using json = nlohmann::json;
-using namespace boost::interprocess;
 
 namespace {
   const std::string PROP_NAME = "rocksdb.dbname";
@@ -131,31 +130,12 @@ namespace ycsbc {
     ERROR      // Operation failed or encountered an issue
   };
   // Struct for handling responses for each requester
-struct ResponseData {
-    interprocess_mutex responseMutex;
-    interprocess_condition responseCondVar;
-    char resultData[256];  // Fixed size array to store result data
-    ResultStatus status;
+  struct ResponseData {
+      std::string resultData;
+      ResultStatus status;
 
-    ResponseData() : status(ResultStatus::ERROR) {
-        resultData[0] = '\0';  // Initialize resultData
-    }
-};
-
-// Define SharedMemoryData struct
-struct SharedMemoryData {
-    interprocess_mutex taskMutex;            // Mutex for task queue
-    interprocess_condition taskCondVar;      // Condition variable for task notification
-    boost::container::vector<std::string> tasks;  // Task queue using vector of strings
-
-    boost::container::map<std::string, ResponseData*> responseMap;  // Map to ResponseData
-    interprocess_mutex responseMutex;        // Mutex for protecting responseMap access
-    bool stopSignal;
-
-    SharedMemoryData() : stopSignal(false) {
-        tasks.reserve(100);  // Reserve space for 100 tasks initially
-    }
-};
+      ResponseData() : status(ResultStatus::ERROR) {}
+  };
 
 std::string getCurrentThreadIdAsString() {
     std::thread::id threadId = std::this_thread::get_id();  // Get the current thread ID
@@ -269,6 +249,10 @@ void RocksdbDB::Init() {
   if (!s.ok()) {
     throw utils::Exception(std::string("RocksDB Open: ") + s.ToString());
   }
+  if (--ref_cnt_) {
+    return;
+  }
+  delete db_;
 }
 
 void RocksdbDB::Cleanup() { 
@@ -480,52 +464,86 @@ void RocksdbDB::DeserializeRow(std::vector<Field> &values, const std::string &da
   DeserializeRow(values, p, lim);
 }
 
+void copyResultData(ResponseData* responseData, const std::string& resultData) {
+    // Copy the result data into the responseData object
+    responseData->resultData = resultData;
+}
+
 ResponseData* SubmitTaskAndWaitForResponse(
-    const std::string& requesterId, 
+    const std::string& requesterId,
     const json& task) {
+    const std::string& server_ip = "127.0.0.1";
+    const std::string& server_port = "12345";
+    try {
+        // Create I/O context and resolver
+        boost::asio::io_context io_context;
+        tcp::resolver resolver(io_context);
+        tcp::resolver::results_type endpoints = resolver.resolve(server_ip, server_port);
 
-    shared_memory_object shm(open_only, "SharedMemorySegment", read_write);
+        // Create and connect the socket
+        tcp::socket socket(io_context);
+        boost::asio::connect(socket, endpoints);
 
-    // Map the whole shared memory in this process
-    mapped_region region(shm, read_write);
+        // Convert task to a string (JSON format)
+        std::string taskString = task.dump() + "\n";
 
-    // Get the address of the mapped region
-    void* addr = region.get_address();
+        // Send the task string to the server
+        boost::asio::write(socket, boost::asio::buffer(taskString));
 
-    // Access the SharedMemoryData structure in this shared memory
-    SharedMemoryData *sharedMemoryData = static_cast<SharedMemoryData*>(addr);
-    // Lock the response map and create a response object if it doesn't exist
-    {
-        boost::interprocess::scoped_lock<boost::interprocess::interprocess_mutex> mapLock(sharedMemoryData->responseMutex);
-        std::cout << &sharedMemoryData->responseMap << std::endl;
-        // Check if the response object for the requesterId exists; if not, create it
-        if (sharedMemoryData->responseMap.find(requesterId) == sharedMemoryData->responseMap.end()) {
+        //std::cout << "Task sent to server: " << taskString << std::endl;
 
-            sharedMemoryData->responseMap[requesterId] = std::make_unique<ResponseData>();
-            std::cout << "SubmitTaskAndWaitForResponse" << std::endl;
+        // Buffer to store the response from the server
+        boost::asio::streambuf responseBuffer;
+        boost::system::error_code error;
+
+        // Wait and read the response from the server
+        boost::asio::read_until(socket, responseBuffer, "\n", error);
+
+        /* auto now = std::chrono::high_resolution_clock::now();
+        auto now_ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(now);
+        auto duration = now_ns.time_since_epoch();  // Duration since epoch in nanoseconds
+        std::cout << "Response received at time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() << std::endl;
+        */
+        if (error && error != boost::asio::error::eof) {
+            throw boost::system::system_error(error);  // Handle read error
         }
-    }
-    // Submit the task to the thread pool by adding it to the shared memory task queue
-    {
-        boost::interprocess::scoped_lock<boost::interprocess::interprocess_mutex> taskLock(sharedMemoryData->taskMutex);
-        sharedMemoryData->tasks.push_back(task.dump());
-    }
-    sharedMemoryData->taskCondVar.notify_one();  // Notify one worker thread
 
-    // Wait for the result from the worker thread (asynchronous task)
-    {
-        boost::interprocess::scoped_lock<boost::interprocess::interprocess_mutex> responseLock(sharedMemoryData->responseMap[requesterId]->responseMutex);
-        ResponseData* response = sharedMemoryData->responseMap[requesterId].get();
+        // Convert the buffer to a string (response from server)
+        std::istream responseStream(&responseBuffer);
+        std::string responseDataString;
+        std::getline(responseStream, responseDataString);
 
-        // Wait until the result is ready
-        response->responseCondVar.wait(responseLock, [response]() {
-            return !response->resultData.empty();  // Condition: result data is available
-        });
+        //std::cout << "Response received: " << responseDataString << std::endl;
+
+        // Parse the response as JSON
+        json responseJson = json::parse(responseDataString);
+
+        // Create a ResponseData object to hold the result
+        ResponseData* responseData = new ResponseData();
+
+        // Extract result data and status from the response JSON
+        std::string resultData = responseJson["resultData"];
+        std::string statusString = responseJson["status"];
+
+        // Copy the result data into the responseData object
+        copyResultData(responseData, resultData);
+
+        // Convert status string to ResultStatus enum
+        if (statusString == "OK") {
+            responseData->status = ResultStatus::OK;
+        } else {
+            responseData->status = ResultStatus::ERROR;
+        }
 
         // Return the response object
-        return response;
+        return responseData;
+
+    } catch (std::exception& e) {
+        std::cerr << "Exception: " << e.what() << "\n";
+        return nullptr;
     }
 }
+
 
 
 
@@ -540,16 +558,16 @@ DB::Status RocksdbDB::ReadSingle(const std::string &table, const std::string &ke
     task["requesterId"] = requesterId;
     task["operation"] = "read";
     task["key"] = key;
-    task["database"] = db_path;
+    task["database"] = db_path;  // Ensure db_path is initialized properly
 
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
     // Check result status
     if (response->status == ResultStatus::ERROR) {
-        return kError;  // Handle the error case (like the original function)
+        return kError;  // Handle the error case
     }
 
-    // Deserialize the result data
+    // Deserialize the result data (no need for strlen anymore)
     std::string data = response->resultData;
 
     // Process result based on whether fields are provided
@@ -573,16 +591,18 @@ DB::Status RocksdbDB::ScanSingle(const std::string &table, const std::string &ke
     json task;
     task["requesterId"] = requesterId;
     task["operation"] = "scan";
-    task["database"] = db_path;  // Assuming db_path is globally defined
+    task["database"] = db_path;  // Ensure db_path is initialized properly
     task["key"] = key;
     task["len"] = len;
 
-    // Use the new generalized function to submit the task and wait for the response
+    // Use the generalized function to submit the task and wait for the response
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
     // Parse the response
     if (response->status == ResultStatus::OK) {
-        std::istringstream stream(response->resultData);  // Read resultData line by line
+        // Use the string from response->resultData directly (no need for manual sizing)
+        std::istringstream stream(response->resultData);  // String stream for parsing lines
+
         std::string line;
         int count = 0;
         while (std::getline(stream, line) && count < len) {
@@ -602,8 +622,6 @@ DB::Status RocksdbDB::ScanSingle(const std::string &table, const std::string &ke
     }
 }
 
-
-
 DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &key,
                                    std::vector<Field> &values) {
     // Convert thread ID to string for requesterId
@@ -614,43 +632,43 @@ DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &
     json readTask;
     readTask["requesterId"] = requesterId;
     readTask["operation"] = "read";
-    readTask["database"] = db_path;  // Assuming db_path is globally defined
+    readTask["database"] = db_path;  // Ensure db_path is properly initialized
     readTask["key"] = key;
 
-    // Use the new generalized function to submit the read task and wait for the response
+    // Submit the read task and wait for the response
     ResponseData* readResponse = SubmitTaskAndWaitForResponse(requesterId, readTask);
 
     // Check if the read was successful and process the response
     std::string existingData;
     if (readResponse->status == ResultStatus::OK) {
-        existingData = readResponse->resultData;  // Get the existing row data
+        existingData = readResponse->resultData;  // Directly get the result data string
     } else if (readResponse->status == ResultStatus::ERROR) {
-        return kNotFound;
+        return kNotFound;  // Return not found if read operation fails
     } else {
         throw utils::Exception("RocksDB Read: Error occurred during read");
     }
 
     // --------- Step 2: Update the data ---------
     std::vector<Field> currentValues;
-    DeserializeRow(currentValues, existingData);
-    assert(currentValues.size() == static_cast<size_t>(fieldcount_));
+    DeserializeRow(currentValues, existingData);  // Deserialize the row into fields
+    assert(currentValues.size() == static_cast<size_t>(fieldcount_));  // Ensure row size matches field count
 
     for (Field &newField : values) {
-        bool found MAYBE_UNUSED = false;
+        bool found = false;
         for (Field &curField : currentValues) {
             if (curField.name == newField.name) {
                 found = true;
-                curField.value = newField.value;  // Update the field value
+                curField.value = newField.value;  // Update the field's value
                 break;
             }
         }
-        assert(found);
+        assert(found);  // Ensure the field to update was found
     }
 
     // --------- Step 3: Insert the updated data using thread pool ---------
     // Serialize the updated values
     std::string updatedData;
-    SerializeRow(currentValues, updatedData);
+    SerializeRow(currentValues, updatedData);  // Serialize updated row into string
 
     // Prepare the insert task as a JSON object
     json insertTask;
@@ -660,12 +678,12 @@ DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &
     insertTask["key"] = key;
     insertTask["value"] = updatedData;
 
-    // Use the new generalized function to submit the insert task and wait for the response
+    // Submit the insert task and wait for the response
     ResponseData* insertResponse = SubmitTaskAndWaitForResponse(requesterId, insertTask);
 
     // Check the insert response status
     if (insertResponse->status == ResultStatus::OK) {
-        return kOK;
+        return kOK;  // Successfully updated and inserted
     } else {
         throw utils::Exception("RocksDB Insert: Error occurred during insert");
     }
@@ -679,27 +697,26 @@ DB::Status RocksdbDB::MergeSingle(const std::string &table, const std::string &k
 
     // Serialize the fields into a string format for merging
     std::string data;
-    SerializeRow(values, data);
+    SerializeRow(values, data);  // Convert the values into a serializable string
 
     // Prepare the merge task as a JSON object
     json task;
     task["requesterId"] = requesterId;
     task["operation"] = "merge";
-    task["database"] = db_path;  // Assuming db_path is globally defined
+    task["database"] = db_path;  // Ensure db_path is properly initialized
     task["key"] = key;
     task["value"] = data;  // Serialized row data for merging
 
-    // Use the new generalized function to submit the merge task and wait for the response
+    // Submit the merge task and wait for the response
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
     // Check the merge response status
     if (response->status == ResultStatus::OK) {
-        return kOK;
+        return kOK;  // Return success if the merge was successful
     } else {
-        return kNotFound;  // Handle error case
+        return kError;  // Return an error in case the merge failed
     }
 }
-
 
 DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &key,
                                    std::vector<Field> &values) {
@@ -708,27 +725,26 @@ DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &
 
     // Serialize the fields into a string format for insertion
     std::string data;
-    SerializeRow(values, data);
+    SerializeRow(values, data);  // Convert the fields into a serializable string
 
     // Prepare the insert task as a JSON object
     json task;
     task["requesterId"] = requesterId;
     task["operation"] = "insert";
-    task["database"] = db_path;  // Assuming db_path is globally defined
+    task["database"] = db_path;  // Ensure db_path is properly initialized
     task["key"] = key;
     task["value"] = data;  // Serialized row data for insertion
 
-    // Use the new generalized function to submit the insert task and wait for the response
+    // Submit the insert task and wait for the response
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
     // Check the insert response status
     if (response->status == ResultStatus::OK) {
-        return kOK;
+        return kOK;  // Return success if the insertion was successful
     } else {
         throw utils::Exception("RocksDB Insert: Error occurred during insertion");
     }
 }
-
 
 DB::Status RocksdbDB::DeleteSingle(const std::string &table, const std::string &key) {
     // Convert thread ID to string for requesterId
@@ -738,20 +754,19 @@ DB::Status RocksdbDB::DeleteSingle(const std::string &table, const std::string &
     json task;
     task["requesterId"] = requesterId;
     task["operation"] = "delete";
-    task["database"] = db_path;  // Assuming db_path is globally defined
-    task["key"] = key;
+    task["database"] = db_path;  // Ensure db_path is initialized
+    task["key"] = key;  // Specify the key to be deleted
 
-    // Use the new generalized function to submit the delete task and wait for the response
+    // Submit the delete task and wait for the response
     ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
 
     // Check the delete response status
     if (response->status == ResultStatus::OK) {
-        return kOK;
+        return kOK;  // Return success if deletion was successful
     } else {
         throw utils::Exception("RocksDB Delete: Error occurred during deletion");
     }
 }
-
 
 DB *NewRocksdbDB() {
   return new RocksdbDB;
