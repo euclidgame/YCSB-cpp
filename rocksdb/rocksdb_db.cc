@@ -7,7 +7,9 @@
 //
 
 #include "rocksdb_db.h"
-
+#include <thread>
+#include <iostream>
+#include <chrono>
 #include "core/core_workload.h"
 #include "core/db_factory.h"
 #include "utils/utils.h"
@@ -21,10 +23,14 @@
 #include <rocksdb/utilities/options_util.h>
 #include <rocksdb/write_batch.h>
 
-#include <rocksdb/db.h>
-#include <rocksdb/options.h>
-#include <rocksdb/rate_limiter.h>
-// #include <rocksdb/util/rate_limiter_multi_tenant_impl.h>
+#include <boost/asio.hpp>
+#include <vector>
+#include "json.hpp"  // For handling JSON
+
+using boost::asio::ip::tcp;
+using json = nlohmann::json;
+
+using json = nlohmann::json;
 
 namespace {
   const std::string PROP_NAME = "rocksdb.dbname";
@@ -138,25 +144,36 @@ namespace {
 
 namespace ycsbc {
 
+
+  enum class ResultStatus {
+    OK,        // Operation successful
+    ERROR      // Operation failed or encountered an issue
+  };
+  // Struct for handling responses for each requester
+  struct ResponseData {
+      std::string resultData;
+      ResultStatus status;
+
+      ResponseData() : status(ResultStatus::ERROR) {}
+  };
+
+std::string getCurrentThreadIdAsString() {
+    std::thread::id threadId = std::this_thread::get_id();  // Get the current thread ID
+    std::stringstream ss;
+    ss << threadId;  // Insert thread ID into stringstream
+    return ss.str();  // Convert the stringstream into a string
+}
+
 std::vector<rocksdb::ColumnFamilyHandle *> RocksdbDB::cf_handles_;
 rocksdb::DB *RocksdbDB::db_ = nullptr;
 int RocksdbDB::ref_cnt_ = 0;
 std::mutex RocksdbDB::mu_;
-
-std::vector<int64_t> stringToIntVector(const std::string& input) {
-  std::vector<int64_t> result;
-  std::stringstream ss(input);
-  std::string item;
-  while (std::getline(ss, item, ',')) {
-    result.push_back(std::stoi(item));
-  }
-  return result;
-}
-
+std::string db_path;
 
 void RocksdbDB::Init() {
   std::cout << "[TGRIGGS_LOG] RocksdbDB::Init\n";
 // merge operator disabled by default due to link error
+
 #ifdef USE_MERGEUPDATE
   class YCSBUpdateMerge : public rocksdb::AssociativeMergeOperator {
    public:
@@ -226,7 +243,7 @@ void RocksdbDB::Init() {
     return;
   }
 
-  const std::string &db_path = props.GetProperty(PROP_NAME, PROP_NAME_DEFAULT);
+  db_path = props.GetProperty(PROP_NAME, PROP_NAME_DEFAULT);
   if (db_path == "") {
     throw utils::Exception("RocksDB db path is missing");
   }
@@ -275,6 +292,10 @@ void RocksdbDB::Init() {
   if (!s.ok()) {
     throw utils::Exception(std::string("RocksDB Open: ") + s.ToString());
   }
+  if (--ref_cnt_) {
+    return;
+  }
+  delete db_;
 }
 
 void RocksdbDB::Cleanup() { 
@@ -565,185 +586,308 @@ void RocksdbDB::DeserializeRow(std::vector<Field> &values, const std::string &da
   DeserializeRow(values, p, lim);
 }
 
-rocksdb::ColumnFamilyHandle* RocksdbDB::table2handle(const std::string& table) {
-  int cf_idx;
-  // std::cout << "[TGRIGGS_LOG] table2handle: " << table << std::endl;
-  // std::cout << "Default column family name: " << rocksdb::kDefaultColumnFamilyName << std::endl;
-  if (table == rocksdb::kDefaultColumnFamilyName) {
-    cf_idx = 0;
-  } else if (table == "cf2") {
-    cf_idx = 1;
-  } else if (table == "cf3") {
-    cf_idx = 2;
-  } else if (table == "cf4") {
-    cf_idx = 3;
-  } else {
-    return nullptr;
-  }
-  assert(cf_idx < cf_handles_.size());
-  return cf_handles_[cf_idx];
+void copyResultData(ResponseData* responseData, const std::string& resultData) {
+    // Copy the result data into the responseData object
+    responseData->resultData = resultData;
 }
 
+ResponseData* SubmitTaskAndWaitForResponse(
+    const std::string& requesterId,
+    const json& task) {
+    const std::string& server_ip = "127.0.0.1";
+    const std::string& server_port = "12345";
+    try {
+        // Create I/O context and resolver
+        boost::asio::io_context io_context;
+        tcp::resolver resolver(io_context);
+        tcp::resolver::results_type endpoints = resolver.resolve(server_ip, server_port);
+
+        // Create and connect the socket
+        tcp::socket socket(io_context);
+        boost::asio::connect(socket, endpoints);
+
+        // Convert task to a string (JSON format)
+        std::string taskString = task.dump() + "\n";
+
+        // Send the task string to the server
+        boost::asio::write(socket, boost::asio::buffer(taskString));
+
+        //std::cout << "Task sent to server: " << taskString << std::endl;
+
+        // Buffer to store the response from the server
+        boost::asio::streambuf responseBuffer;
+        boost::system::error_code error;
+
+        // Wait and read the response from the server
+        boost::asio::read_until(socket, responseBuffer, "\n", error);
+
+        /* auto now = std::chrono::high_resolution_clock::now();
+        auto now_ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(now);
+        auto duration = now_ns.time_since_epoch();  // Duration since epoch in nanoseconds
+        std::cout << "Response received at time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() << std::endl;
+        */
+        if (error && error != boost::asio::error::eof) {
+            throw boost::system::system_error(error);  // Handle read error
+        }
+
+        // Convert the buffer to a string (response from server)
+        std::istream responseStream(&responseBuffer);
+        std::string responseDataString;
+        std::getline(responseStream, responseDataString);
+
+        //std::cout << "Response received: " << responseDataString << std::endl;
+
+        // Parse the response as JSON
+        json responseJson = json::parse(responseDataString);
+
+        // Create a ResponseData object to hold the result
+        ResponseData* responseData = new ResponseData();
+
+        // Extract result data and status from the response JSON
+        std::string resultData = responseJson["resultData"];
+        std::string statusString = responseJson["status"];
+
+        // Copy the result data into the responseData object
+        copyResultData(responseData, resultData);
+
+        // Convert status string to ResultStatus enum
+        if (statusString == "OK") {
+            responseData->status = ResultStatus::OK;
+        } else {
+            responseData->status = ResultStatus::ERROR;
+        }
+
+        // Return the response object
+        return responseData;
+
+    } catch (std::exception& e) {
+        std::cerr << "Exception: " << e.what() << "\n";
+        return nullptr;
+    }
+}
+
+
+
+
+// Example function modified for proper boost::interprocess usage
 DB::Status RocksdbDB::ReadSingle(const std::string &table, const std::string &key,
                                  const std::vector<std::string> *fields,
                                  std::vector<Field> &result) {
-  std::string data;
+    std::string requesterId = getCurrentThreadIdAsString();
 
-  auto* handle = table2handle(table);
-  if (handle == nullptr) {
-    std::cout << "[TGRIGGS_LOG] Bad table/handle: " << table << std::endl;
-    return kError;
-  }
-  // std::cout << "[TGRIGGS_LOG] ReadSingle: " << key << std::endl;
-  // Set the rate limiter priority to highest (USER request).
-  rocksdb::ReadOptions read_options = rocksdb::ReadOptions();
-  read_options.rate_limiter_priority = rocksdb::Env::IOPriority::IO_USER;
+    // Prepare the task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "read";
+    task["key"] = key;
+    task["database"] = db_path;  // Ensure db_path is initialized properly
 
-  rocksdb::Status s = db_->Get(read_options, handle, key, &data);
-  if (s.IsNotFound()) {
-    // std::cout << "Key not found: " << key << std::endl;
-    return kNotFound;
-  } else if (!s.ok()) {
-    throw utils::Exception(std::string("RocksDB Get: ") + s.ToString());
-  }
-  if (fields != nullptr) {
-    DeserializeRowFilter(result, data, *fields);
-  } else {
-    DeserializeRow(result, data);
-    assert(result.size() == static_cast<size_t>(fieldcount_));
-  }
-  // std::cout << "Key found: " << key << std::endl;
-  return kOK;
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
+
+    // Check result status
+    if (response->status == ResultStatus::ERROR) {
+        return kError;  // Handle the error case
+    }
+
+    // Deserialize the result data (no need for strlen anymore)
+    std::string data = response->resultData;
+
+    // Process result based on whether fields are provided
+    if (fields != nullptr) {
+        DeserializeRowFilter(result, data, *fields);  // Deserialize with field filter
+    } else {
+        DeserializeRow(result, data);  // Deserialize entire row
+        assert(result.size() == static_cast<size_t>(fieldcount_));
+    }
+
+    return kOK;
 }
 
 DB::Status RocksdbDB::ScanSingle(const std::string &table, const std::string &key, int len,
                                  const std::vector<std::string> *fields,
                                  std::vector<std::vector<Field>> &result) {
-  auto* handle = table2handle(table);
-  if (handle == nullptr) {
-    std::cout << "[TGRIGGS_LOG] Bad table/handle: " << table << std::endl;
-    return kError;
-  }
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
 
-  // Set the rate limiter priority to highest (USER request).
-  rocksdb::ReadOptions read_options = rocksdb::ReadOptions();
-  read_options.rate_limiter_priority = rocksdb::Env::IOPriority::IO_USER;
+    // Prepare the task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "scan";
+    task["database"] = db_path;  // Ensure db_path is initialized properly
+    task["key"] = key;
+    task["len"] = len;
 
-  rocksdb::Iterator *db_iter = db_->NewIterator(read_options, handle);
-  db_iter->Seek(key);
-  for (int i = 0; db_iter->Valid() && i < len; i++) {
-    std::string data = db_iter->value().ToString();
-    result.push_back(std::vector<Field>());
-    std::vector<Field> &values = result.back();
-    if (fields != nullptr) {
-      DeserializeRowFilter(values, data, *fields);
+    // Use the generalized function to submit the task and wait for the response
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
+
+    // Parse the response
+    if (response->status == ResultStatus::OK) {
+        // Use the string from response->resultData directly (no need for manual sizing)
+        std::istringstream stream(response->resultData);  // String stream for parsing lines
+
+        std::string line;
+        int count = 0;
+        while (std::getline(stream, line) && count < len) {
+            result.push_back(std::vector<Field>());
+            std::vector<Field> &values = result.back();
+            if (fields != nullptr) {
+                DeserializeRowFilter(values, line, *fields);
+            } else {
+                DeserializeRow(values, line);
+                assert(values.size() == static_cast<size_t>(fieldcount_));
+            }
+            count++;
+        }
+        return kOK;
     } else {
-      DeserializeRow(values, data);
-      assert(values.size() == static_cast<size_t>(fieldcount_));
+        return kNotFound;  // Handle error or not found case
     }
-    db_iter->Next();
-  }
-  delete db_iter;
-  return kOK;
 }
 
 DB::Status RocksdbDB::UpdateSingle(const std::string &table, const std::string &key,
                                    std::vector<Field> &values) {
-  // Set the rate limiter priority to highest (USER request).
-  rocksdb::ReadOptions read_options = rocksdb::ReadOptions();
-  read_options.rate_limiter_priority = rocksdb::Env::IOPriority::IO_USER;
-  
-  std::string data;
-  rocksdb::Status s = db_->Get(read_options, key, &data);
-  if (s.IsNotFound()) {
-    return kNotFound;
-  } else if (!s.ok()) {
-    throw utils::Exception(std::string("RocksDB Get: ") + s.ToString());
-  }
-  std::vector<Field> current_values;
-  DeserializeRow(current_values, data);
-  assert(current_values.size() == static_cast<size_t>(fieldcount_));
-  for (Field &new_field : values) {
-    bool found MAYBE_UNUSED = false;
-    for (Field &cur_field : current_values) {
-      if (cur_field.name == new_field.name) {
-        found = true;
-        cur_field.value = new_field.value;
-        break;
-      }
-    }
-    assert(found);
-  }
-  rocksdb::WriteOptions wopt;
-  // TODO: WAL disabled
-  wopt.disableWAL = true;
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
 
-  data.clear();
-  SerializeRow(current_values, data);
-  s = db_->Put(wopt, key, data);
-  if (!s.ok()) {
-    throw utils::Exception(std::string("RocksDB Put: ") + s.ToString());
-  }
-  return kOK;
+    // --------- Step 1: Read the existing data using thread pool ---------
+    // Prepare the read task as a JSON object
+    json readTask;
+    readTask["requesterId"] = requesterId;
+    readTask["operation"] = "read";
+    readTask["database"] = db_path;  // Ensure db_path is properly initialized
+    readTask["key"] = key;
+
+    // Submit the read task and wait for the response
+    ResponseData* readResponse = SubmitTaskAndWaitForResponse(requesterId, readTask);
+
+    // Check if the read was successful and process the response
+    std::string existingData;
+    if (readResponse->status == ResultStatus::OK) {
+        existingData = readResponse->resultData;  // Directly get the result data string
+    } else if (readResponse->status == ResultStatus::ERROR) {
+        return kNotFound;  // Return not found if read operation fails
+    } else {
+        throw utils::Exception("RocksDB Read: Error occurred during read");
+    }
+
+    // --------- Step 2: Update the data ---------
+    std::vector<Field> currentValues;
+    DeserializeRow(currentValues, existingData);  // Deserialize the row into fields
+    assert(currentValues.size() == static_cast<size_t>(fieldcount_));  // Ensure row size matches field count
+
+    for (Field &newField : values) {
+        bool found = false;
+        for (Field &curField : currentValues) {
+            if (curField.name == newField.name) {
+                found = true;
+                curField.value = newField.value;  // Update the field's value
+                break;
+            }
+        }
+        assert(found);  // Ensure the field to update was found
+    }
+
+    // --------- Step 3: Insert the updated data using thread pool ---------
+    // Serialize the updated values
+    std::string updatedData;
+    SerializeRow(currentValues, updatedData);  // Serialize updated row into string
+
+    // Prepare the insert task as a JSON object
+    json insertTask;
+    insertTask["requesterId"] = requesterId;
+    insertTask["operation"] = "insert";
+    insertTask["database"] = db_path;
+    insertTask["key"] = key;
+    insertTask["value"] = updatedData;
+
+    // Submit the insert task and wait for the response
+    ResponseData* insertResponse = SubmitTaskAndWaitForResponse(requesterId, insertTask);
+
+    // Check the insert response status
+    if (insertResponse->status == ResultStatus::OK) {
+        return kOK;  // Successfully updated and inserted
+    } else {
+        throw utils::Exception("RocksDB Insert: Error occurred during insert");
+    }
 }
+
 
 DB::Status RocksdbDB::MergeSingle(const std::string &table, const std::string &key,
                                   std::vector<Field> &values) {
-  std::string data;
-  SerializeRow(values, data);
-  rocksdb::WriteOptions wopt;
-  rocksdb::Status s = db_->Merge(wopt, key, data);
-  if (!s.ok()) {
-    throw utils::Exception(std::string("RocksDB Merge: ") + s.ToString());
-  }
-  return kOK;
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
+
+    // Serialize the fields into a string format for merging
+    std::string data;
+    SerializeRow(values, data);  // Convert the values into a serializable string
+
+    // Prepare the merge task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "merge";
+    task["database"] = db_path;  // Ensure db_path is properly initialized
+    task["key"] = key;
+    task["value"] = data;  // Serialized row data for merging
+
+    // Submit the merge task and wait for the response
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
+
+    // Check the merge response status
+    if (response->status == ResultStatus::OK) {
+        return kOK;  // Return success if the merge was successful
+    } else {
+        return kError;  // Return an error in case the merge failed
+    }
 }
 
 DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &key,
                                    std::vector<Field> &values) {
-  auto* handle = table2handle(table);
-  if (handle == nullptr) {
-    std::cout << "[TGRIGGS_LOG] Bad table/handle: " << table << std::endl;
-    return kError;
-  }
-  
-  std::string data;
-  SerializeRow(values, data);
-  rocksdb::WriteOptions wopt;
-  // TODO: WAL disabled
-  wopt.disableWAL = true;
-  rocksdb::Status s = db_->Put(wopt, handle, key, data);
-  // rocksdb::Status s = db_->Put(wopt, key, data);
-  if (!s.ok()) {
-    throw utils::Exception(std::string("RocksDB Put: ") + s.ToString());
-  }
-  return kOK;
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
+
+    // Serialize the fields into a string format for insertion
+    std::string data;
+    SerializeRow(values, data);  // Convert the fields into a serializable string
+
+    // Prepare the insert task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "insert";
+    task["database"] = db_path;  // Ensure db_path is properly initialized
+    task["key"] = key;
+    task["value"] = data;  // Serialized row data for insertion
+
+    // Submit the insert task and wait for the response
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
+
+    // Check the insert response status
+    if (response->status == ResultStatus::OK) {
+        return kOK;  // Return success if the insertion was successful
+    } else {
+        throw utils::Exception("RocksDB Insert: Error occurred during insertion");
+    }
 }
 
-DB::Status RocksdbDB::InsertMany(const std::string &table, int start_key,
-                      std::vector<Field> &values, int num_keys) {
-  auto* handle = table2handle(table);
-  if (handle == nullptr) {
-    std::cout << "[TGRIGGS_LOG] Bad table/handle: " << table << std::endl;
-    return kError;
-  }
-  
-  std::string data;
-  SerializeRow(values, data);
-  rocksdb::WriteBatch batch;
-  for (int i = 0; i < num_keys; ++i) {
-    batch.Put(handle, "user" + std::to_string(start_key + i), data);
-  }
+DB::Status RocksdbDB::DeleteSingle(const std::string &table, const std::string &key) {
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
 
-  rocksdb::WriteOptions wopt;
-  // TODO: WAL disabled
-  wopt.disableWAL = true;
-  rocksdb::Status s = db_->Write(wopt, &batch);
+    // Prepare the delete task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "delete";
+    task["database"] = db_path;  // Ensure db_path is initialized
+    task["key"] = key;  // Specify the key to be deleted
 
-  if (!s.ok()) {
-    throw utils::Exception(std::string("RocksDB WriteBatch: ") + s.ToString());
-  }
-  return kOK;
+    // Submit the delete task and wait for the response
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
+
+    // Check the delete response status
+    if (response->status == ResultStatus::OK) {
+        return kOK;  // Return success if deletion was successful
+    } else {
+        throw utils::Exception("RocksDB Delete: Error occurred during deletion");
+    }
 }
 
 // TODO(tgriggs): remove this
@@ -809,12 +953,25 @@ std::vector<ycsbc::utils::MultiTenantResourceUsage> RocksdbDB::GetResourceUsage(
 }
 
 DB::Status RocksdbDB::DeleteSingle(const std::string &table, const std::string &key) {
-  rocksdb::WriteOptions wopt;
-  rocksdb::Status s = db_->Delete(wopt, key);
-  if (!s.ok()) {
-    throw utils::Exception(std::string("RocksDB Delete: ") + s.ToString());
-  }
-  return kOK;
+    // Convert thread ID to string for requesterId
+    std::string requesterId = getCurrentThreadIdAsString();
+
+    // Prepare the delete task as a JSON object
+    json task;
+    task["requesterId"] = requesterId;
+    task["operation"] = "delete";
+    task["database"] = db_path;  // Ensure db_path is initialized
+    task["key"] = key;  // Specify the key to be deleted
+
+    // Submit the delete task and wait for the response
+    ResponseData* response = SubmitTaskAndWaitForResponse(requesterId, task);
+
+    // Check the delete response status
+    if (response->status == ResultStatus::OK) {
+        return kOK;  // Return success if deletion was successful
+    } else {
+        throw utils::Exception("RocksDB Delete: Error occurred during deletion");
+    }
 }
 
 DB *NewRocksdbDB() {

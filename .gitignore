@@ -11,3 +11,5 @@ compile_commands.json
 log/
 .out
 .txt
+results/
+build/
