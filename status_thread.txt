@@ -1,12 +1,26 @@
-[YCSB] Uniform distribution.
+[YCSB] Zipfian distribution.
+Thread ops for client 0: 1750000
+Thread ops for client 1: 1750000
 [YCSB] Pinning client to 8
-[YCSB] Exp time: 0s
 [YCSB] Initializing database
 [YCSB] RocksdbDB::Init
+[YCSB] Exp time: 0s
+[YCSB] Pinning client to 9
 [YCSB] db_path: /home/windsey/ycsb-rocksdb-data
+[YCSB] Initializing database
+[YCSB] RocksdbDB::Init
 Entering GetOptions
 YCSB write buffer size: 67108864
-[YCSB] refill period set to 0
+[TGRIGGS_LOG] per-client bytes/s limit:
+[TGRIGGS_LOG] Client 0: 57671680
+[TGRIGGS_LOG] Client 1: 57671680
+[TGRIGGS_LOG] Client 2: 57671680
+[TGRIGGS_LOG] Client 3: 57671680
+[TGRIGGS_LOG] per-client bytes/s limit:
+[TGRIGGS_LOG] Client 0: 110100480
+[TGRIGGS_LOG] Client 1: 110100480
+[TGRIGGS_LOG] Client 2: 110100480
+[TGRIGGS_LOG] Client 3: 110100480
 [YCSB] GetOptions done
 [YCSB] creating stats object
 [YCSB] opening db with default column family
@@ -15,35 +29,20 @@ YCSB write buffer size: 67108864
 [31m[RocksDB] Trying to Open Column family: default[0m
 [31m[RocksDB] Validated Options by Table[0m
 [31m[RocksDB] Validated Options[0m
-[31m[RocksDB] Tryin to start scheduler[0m
-[31m[RocksDB] Tryin to register[0m
-[YCSB] Database initialized
-[YCSB] Exp time: 0s
-1730517189662,0,INSERT,214,10231.81,2215.94,2298.13,2248.70,2299.90,2447.36,10231.81
-[YCSB] Exp time: 5s
-[YCSB] Exp time: 5s
-1730517194670,0,INSERT,216,2553.86,2205.70,2267.55,2260.99,2308.09,2392.06,2553.86
-[YCSB] Exp time: 10s
-[YCSB] Exp time: 10s
-1730517199681,0,INSERT,218,2347.01,2199.55,2255.35,2252.80,2289.66,2334.72,2347.01
-[YCSB] Exp time: 15s
-[YCSB] Exp time: 15s
-1730517204689,0,INSERT,215,2719.74,2226.18,2286.17,2279.42,2332.67,2381.82,2719.74
-[YCSB] Exp time: 20s
-[YCSB] Exp time: 20s
-1730517209697,0,INSERT,220,2324.48,2199.55,2236.08,2230.27,2269.18,2314.24,2324.48
-[YCSB] Exp time: 25s
-[YCSB] Exp time: 25s
-1730517214704,0,INSERT,218,2406.40,2199.55,2250.40,2244.61,2283.52,2373.63,2406.40
-[YCSB] Exp time: 30s
-[YCSB] Exp time: 30s
-1730517219713,0,INSERT,217,2424.83,2207.74,2258.00,2250.75,2291.71,2351.10,2424.83
-[YCSB] Exp time: 35s
-[YCSB] Exp time: 35s
-1730517224721,0,INSERT,221,2383.87,2191.36,2222.71,2220.03,2246.66,2279.42,2383.87
-[YCSB] Exp time: 40s
-[YCSB] Exp time: 40s
-1730517229729,0,INSERT,219,3217.41,2201.60,2243.27,2236.41,2258.94,2320.38,3217.41
-[YCSB] Exp time: 45s
-[YCSB] Exp time: 45s
-Exception: Connection reset by peer
+[31m[RocksDB] DB::Open failed here![0m
+[31m[RocksDB] DB::Open failed due to register record[0m
+[YCSB] db_path: /home/windsey/ycsb-rocksdb-data
+Entering GetOptions
+YCSB write buffer size: 67108864
+[TGRIGGS_LOG] per-client bytes/s limit:
+[TGRIGGS_LOG] Client 0: 57671680
+[TGRIGGS_LOG] Client 1: 57671680
+[TGRIGGS_LOG] Client 2: 57671680
+[TGRIGGS_LOG] Client 3: 57671680
+[TGRIGGS_LOG] per-client bytes/s limit:
+[TGRIGGS_LOG] Client 0: 110100480
+[TGRIGGS_LOG] Client 1: 110100480
+[TGRIGGS_LOG] Client 2: 110100480
+[TGRIGGS_LOG] Client 3: 110100480
+[YCSB] GetOptions done
+[YCSB] creating stats object
