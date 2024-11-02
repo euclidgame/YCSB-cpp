@@ -83,10 +83,12 @@ class DBWrapper : public DB {
     return s;
   }
   Status Insert(const std::string &table, const std::string &key, std::vector<Field> &values, int client_id) {
+    std::cout << "Inserting key: " << key << std::endl;
     timer_.Start();
     Status s = db_->Insert(table, key, values);
     uint64_t elapsed = timer_.End();
     if (s == kOK) {
+      std::cout << "Elapsed time: " << elapsed << std::endl;
       measurements_->Report(INSERT, elapsed);
       per_client_measurements_[client_id]->Report(INSERT, elapsed);
       per_client_bytes_written_->update(client_id, values.size() * values[0].value.size());

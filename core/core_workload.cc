@@ -188,10 +188,10 @@ void CoreWorkload::Init(const utils::Properties &p) {
   transaction_insert_key_sequence_ = new AcknowledgedCounterGenerator(record_count_);
 
   if (request_dist == "uniform") {
-    std::cout << "[TGRIGGS_LOG] Uniform distribution." << std::endl;
+    std::cout << "[YCSB] Uniform distribution." << std::endl;
     key_chooser_ = new UniformGenerator(0, record_count_ - 1);
   } else if (request_dist == "zipfian") {
-    std::cout << "[TGRIGGS_LOG] Zipfian distribution." << std::endl;
+    std::cout << "[YCSB] Zipfian distribution." << std::endl;
     // If the number of keys changes, we don't want to change popular keys.
     // So we construct the scrambled zipfian generator with a keyspace
     // that is larger than what exists at the beginning of the test.
@@ -304,7 +304,7 @@ bool CoreWorkload::DoTransaction(DB &db, int client_id) {
     table_name = "cf4";
   }
 
-  // std::cout << "[TGRIGGS_LOG] Table name: " << table_name << std::endl;
+  // std::cout << "[YCSB] Table name: " << table_name << std::endl;
 
   DB::Status status;
   if (op_mode_real_) {
@@ -329,7 +329,7 @@ bool CoreWorkload::DoTransaction(DB &db, int client_id) {
         status = TransactionRandomInsert(db, client_id, table_name);
         break;
       default:
-        std::cout << "[TGRIGGS_LOG] Unknown op: " << op_choice << std::endl;
+        std::cout << "[YCSB] Unknown op: " << op_choice << std::endl;
         throw utils::Exception("Operation request is not recognized!");
     }
   } else {

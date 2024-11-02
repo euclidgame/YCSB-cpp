@@ -9,7 +9,7 @@ compile_commands.json
 .clangd/
 .cache/
 log/
-.out
-.txt
+*.out
+*.txt
 results/
 build/

@@ -42,7 +42,7 @@ inline std::tuple<long long, std::vector<int>> ClientThread(ycsbc::DB *db, ycsbc
 
   size_t cpu_for_client = client_id + 8;
   CPU_SET(cpu_for_client, &cpuset);
-  std::cout << "[TGRIGGS_LOG] Pinning client to " << cpu_for_client << std::endl;
+  std::cout << "[YCSB] Pinning client to " << cpu_for_client << std::endl;
   int rc = pthread_setaffinity_np(pthread_self(),
                                   sizeof(cpu_set_t), &cpuset);
   if (rc != 0) {
@@ -84,7 +84,9 @@ inline std::tuple<long long, std::vector<int>> ClientThread(ycsbc::DB *db, ycsbc
 
   try {
     if (init_db) {
+      std::cout << "[YCSB] Initializing database" << std::endl;
       db->Init();
+      std::cout << "[YCSB] Database initialized" << std::endl;
     }
 
     auto client_start = std::chrono::system_clock::now();
@@ -145,7 +147,7 @@ inline std::tuple<long long, std::vector<int>> ClientThread(ycsbc::DB *db, ycsbc
     op_progress.push_back(ops);
     return std::make_tuple(client_start_micros, op_progress);
   } catch (const utils::Exception &e) {
-    std::cerr << "Caught exception: " << e.what() << std::endl;
+    std::cerr << "[YCSB] Caught exception: " << e.what() << std::endl;
     exit(1);
   }
 }

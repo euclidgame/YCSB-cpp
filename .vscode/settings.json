@@ -77,6 +77,10 @@
         "typeindex": "cpp",
         "valarray": "cpp",
         "variant": "cpp",
-        "*.ipp": "cpp"
+        "*.ipp": "cpp",
+        "ranges": "cpp",
+        "span": "cpp",
+        "coroutine": "cpp",
+        "source_location": "cpp"
     }
 }

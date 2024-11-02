@@ -166,7 +166,7 @@ std::vector<int64_t> ComputePRFAllocation(
 
   // for (size_t i = 0; i < num_clients; ++i) {
   //   if (allocation[i] > int64_t(513)) {
-  //     std::cout << "[TGRIGGS_LOG] Allocation for client " << i << " is " << allocation[i] << std::endl;
+  //     std::cout << "[YCSB] Allocation for client " << i << " is " << allocation[i] << std::endl;
   //   }
   // }
 
@@ -258,7 +258,7 @@ void CentralResourceSchedulerThread(
         first_time = false;
         continue;
       }
-      // std::cout << "[TGRIGGS_LOG] Usage in this interval: " << std::endl;
+      // std::cout << "[YCSB] Usage in this interval: " << std::endl;
       // for (const auto& usage : interval_usage) {
       //   std::cout << usage.ToString();
       // }
