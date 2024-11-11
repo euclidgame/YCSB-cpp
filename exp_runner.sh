@@ -60,6 +60,9 @@ mpstat_pid=$!
   -s -p operationcount=6000000 \
   -p recordcount=31250000 \
   -threads 4 \
+  -p client_to_op_map="RANDOM_INSERT,RANDOM_INSERT,RANDOM_INSERT,RANDOM_INSERT" \
+  -p rocksdb.num_cfs="4" \
+  -p client_to_cf_map="default,cf2,cf3,cf4" \
   -p status.interval_ms=500 \
   -target_rates "2500,1000,500,10" \
   -p refill_period=5 \

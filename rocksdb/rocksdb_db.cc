@@ -546,20 +546,6 @@ namespace ycsbc
     std::cout << "[YCSB] GetOptions done\n";
   }
 
-  std::vector<std::string> Prop2vector(const utils::Properties &props, const std::string &prop, const std::string &default_val)
-  {
-    std::string vals = props.GetProperty(prop, default_val);
-    std::vector<std::string> output;
-    std::string val;
-
-    std::istringstream stream(vals);
-    while (std::getline(stream, val, ':'))
-    {
-      output.push_back(val);
-    }
-    return output;
-  }
-
   void RocksdbDB::GetCfOptions(const utils::Properties &props, std::vector<rocksdb::ColumnFamilyOptions> &cf_opt)
   {
     std::vector<std::string> vals = Prop2vector(props, PROP_MAX_WRITE_BUFFER, PROP_MAX_WRITE_BUFFER_DEFAULT);
@@ -705,6 +691,30 @@ namespace ycsbc
     return cf_handles_[cf_idx];
   }
 
+  DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &key,
+                                     std::vector<Field> &values)
+  {
+    auto *handle = table2handle(table);
+    if (handle == nullptr)
+    {
+      std::cout << "[TGRIGGS_LOG] Bad table/handle: " << table << std::endl;
+      return kError;
+    }
+
+    std::string data;
+    SerializeRow(values, data);
+    rocksdb::WriteOptions wopt;
+    // TODO: WAL disabled
+    wopt.disableWAL = true;
+    rocksdb::Status s = db_->Put(wopt, handle, key, data);
+    // rocksdb::Status s = db_->Put(wopt, key, data);
+    if (!s.ok())
+    {
+      throw utils::Exception(std::string("RocksDB Put: ") + s.ToString());
+    }
+    return kOK;
+  }
+
   DB::Status RocksdbDB::ReadSingle(const std::string &table, const std::string &key,
                                    const std::vector<std::string> *fields,
                                    std::vector<Field> &result)
@@ -840,52 +850,6 @@ namespace ycsbc
     if (!s.ok())
     {
       throw utils::Exception(std::string("RocksDB Merge: ") + s.ToString());
-    }
-    return kOK;
-  }
-
-  rocksdb::Options opt;
-  opt.create_if_missing = true;
-  opt.create_missing_column_families = true;
-  std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs;
-  GetOptions(props, &opt, &cf_descs);
-
-  std::vector<rocksdb::ColumnFamilyOptions> cf_opts;
-  const int num_cfs = std::stoi(props.GetProperty(PROP_NUM_CFS, PROP_NUM_CFS_DEFAULT));
-  for (int i = 0; i < num_cfs; ++i) {
-    cf_opts.push_back(rocksdb::ColumnFamilyOptions());
-  }
-  GetCfOptions(props, cf_opts);
-  for (int i = 0; i < num_cfs; ++i) {
-    std::string cf_name;
-    if (i == 0) {
-      cf_name = rocksdb::kDefaultColumnFamilyName;
-    } else {
-      cf_name = "cf" + std::to_string(i+1);
-    }
-    cf_descs.emplace_back(cf_name, cf_opts[i]);
-    std::cout << "[FAIRDB_LOG] Init column family: " << cf_name << std::endl;
-  }
-
-  opt.statistics = rocksdb::CreateDBStatistics();
-
-  rocksdb::Status s;
-  if (props.GetProperty(PROP_DESTROY, PROP_DESTROY_DEFAULT) == "true") {
-    s = rocksdb::DestroyDB(db_path, opt);
-    if (!s.ok()) {
-      throw utils::Exception(std::string("RocksDB DestroyDB: ") + s.ToString());
-    }
-
-    std::string data;
-    SerializeRow(values, data);
-    rocksdb::WriteOptions wopt;
-    // TODO: WAL disabled
-    wopt.disableWAL = true;
-    rocksdb::Status s = db_->Put(wopt, handle, key, data);
-    // rocksdb::Status s = db_->Put(wopt, key, data);
-    if (!s.ok())
-    {
-      throw utils::Exception(std::string("RocksDB Put: ") + s.ToString());
     }
     return kOK;
   }
