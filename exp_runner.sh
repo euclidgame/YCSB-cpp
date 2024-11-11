@@ -58,9 +58,9 @@ mpstat_pid=$!
   -p requestdistribution=zipfian \
   -s -p operationcount=6000000 \
   -p recordcount=31250000 \
-  -threads 1 \
+  -threads 4 \
   -p status.interval_ms=500 \
-  -target_rates "4500,2000,1000,100" \
+  -target_rates "2500,1000,500,10" \
   -p refill_period=5 \
   -p real_op_mode=false \
   -p status=true \

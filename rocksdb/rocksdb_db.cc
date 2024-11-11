@@ -251,7 +251,8 @@ namespace ycsbc
     rocksdb::Options opt;
     opt.create_if_missing = true;
     opt.create_missing_column_families = true;
-    opt.db_write_buffer_size = 512 * 1024 * 1024;
+    opt.db_write_buffer_size = 256 * 1024 * 1024;
+    opt.delayed_write_rate = std::numeric_limits<uint64_t>::max();
     opt.info_log_level = rocksdb::InfoLogLevel::DEBUG_LEVEL;
     opt.statistics = rocksdb::CreateDBStatistics();
     opt.stats_dump_period_sec = 60; // Dump stats every 60 seconds
@@ -562,12 +563,12 @@ namespace ycsbc
     for (size_t i = 0; i < cf_opt.size(); ++i)
     {
       cf_opt[i].max_write_buffer_number = std::stoi(vals[i]);
-      // cf_opt[i].soft_pending_compaction_bytes_limit = static_cast<uint64_t>(128) * 1024 * 1024 * 1024; // 128GB
-      // cf_opt[i].hard_pending_compaction_bytes_limit = static_cast<uint64_t>(256) * 1024 * 1024 * 1024; // 256GB
+      cf_opt[i].soft_pending_compaction_bytes_limit = static_cast<uint64_t>(128) * 1024 * 1024 * 1024; // 128GB
+      cf_opt[i].hard_pending_compaction_bytes_limit = static_cast<uint64_t>(256) * 1024 * 1024 * 1024; // 256GB
       // cf_opt[i].min_write_buffer_number_to_merge = 2;
       cf_opt[i].write_buffer_size = 64 * 1024 * 1024;
-      // cf_opt[i].level0_slowdown_writes_trigger = 1000;
-      // cf_opt[i].level0_stop_writes_trigger = 1000;
+      cf_opt[i].level0_slowdown_writes_trigger = 1000;
+      cf_opt[i].level0_stop_writes_trigger = 1000;
       // cf_opt[i].max_write_buffer_number_to_maintain = 4;
     }
     vals = Prop2vector(props, PROP_WRITE_BUFFER_SIZE, PROP_WRITE_BUFFER_SIZE_DEFAULT);
@@ -975,16 +976,30 @@ namespace ycsbc
     return kOK;
   }
 
-  uint64_t RocksdbDB::GetCurSizeActiveMemtable()
+  uint64_t RocksdbDB::GetCurSizeActiveMemtable(int client_id)
   {
     uint64_t active_memtable_size = 0;
-    if (db_->GetIntProperty("rocksdb.cur-size-active-mem-table", &active_memtable_size))
+    if (db_->GetIntProperty(cf_handles_[client_id], "rocksdb.cur-size-active-mem-table", &active_memtable_size))
     {
       return active_memtable_size;
     }
     else
     {
       std::cerr << "Failed to retrieve active memtable size for client " << std::endl;
+      return -1;
+    }
+  }
+
+  uint64_t RocksdbDB::GetNumImmutableMemtable(int client_id)
+  {
+    uint64_t num_immutable_memtables = 0;
+    if (db_->GetIntProperty(cf_handles_[client_id], "rocksdb.num-immutable-mem-table", &num_immutable_memtables))
+    {
+      return num_immutable_memtables;
+    }
+    else
+    {
+      std::cerr << "Failed to retrieve number of immutable memtables for client " << std::endl;
       return -1;
     }
   }

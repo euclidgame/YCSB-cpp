@@ -111,7 +111,9 @@ void StatusThread(ycsbc::Measurements *measurements, std::vector<ycsbc::Measurem
       }
       if (started)
       {
-        memtable_size_logfile << duration_since_epoch_ms << ',' << i << ',' << dbs[i]->GetCurSizeActiveMemtable() << std::endl;
+        memtable_size_logfile << duration_since_epoch_ms << ',' << i << ','
+                              << dbs[i]->GetCurSizeActiveMemtable(i) << ','
+                              << dbs[i]->GetNumImmutableMemtable(i) << std::endl;
       }
       per_client_measurements[i]->Reset();
     }

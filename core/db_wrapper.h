@@ -165,9 +165,14 @@ namespace ycsbc
       db_->UpdateMemtableSize(client_id, memtable_size_bytes);
     }
 
-    uint64_t GetCurSizeActiveMemtable() override
+    uint64_t GetCurSizeActiveMemtable(int client_id) override
     {
-      return db_->GetCurSizeActiveMemtable();
+      return db_->GetCurSizeActiveMemtable(client_id);
+    }
+
+    uint64_t GetNumImmutableMemtable(int client_id) override
+    {
+      return db_->GetNumImmutableMemtable(client_id);
     }
 
     void UpdateResourceShares(std::vector<ycsbc::utils::MultiTenantResourceShares> res_opts)

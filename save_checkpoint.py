@@ -11,7 +11,8 @@ def save_checkpoint(checkpoint_name):
     files_to_copy = [
         'iostat_results.csv',
         'mpstat_results.csv',
-        'logs/client_stats.log'
+        'logs/client_stats.log',
+        'logs/memtable_size.log'
     ]
 
     # Path of the LOG file in /home/{USER}/ycsb-rocksdb-data/

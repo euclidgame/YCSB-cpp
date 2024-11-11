@@ -69,7 +69,8 @@ namespace ycsbc
     void UpdateMemtableSize(int client_id, int memtable_size_bytes);
     void UpdateResourceShares(std::vector<ycsbc::utils::MultiTenantResourceShares> res_opts);
     std::vector<ycsbc::utils::MultiTenantResourceUsage> GetResourceUsage();
-    uint64_t GetCurSizeActiveMemtable() override;
+    uint64_t GetCurSizeActiveMemtable(int client_id) override;
+    uint64_t GetNumImmutableMemtable(int client_id) override;
 
     void PrintDbStats();
     rocksdb::ColumnFamilyHandle *table2handle(const std::string &table);

@@ -13,3 +13,4 @@ logs/
 *.txt
 nohup.out
 build/
+results/
