@@ -115,13 +115,77 @@ const std::string CoreWorkload::BURST_GAP_S_DEFAULT = "0";
 const std::string CoreWorkload::BURST_SIZE_OPS = "burst_size_ops";
 const std::string CoreWorkload::BURST_SIZE_OPS_DEFAULT = "0";
 
+const std::string CoreWorkload::CLIENT_TO_CF_MAP = "client_to_cf_map";
+const std::string CoreWorkload::CLIENT_TO_CF_MAP_DEFAULT = "default,cf2,cf3,cf4";
+
+const std::string CoreWorkload::CLIENT_TO_OP_MAP = "client_to_op_map";
+const std::string CoreWorkload::CLIENT_TO_OP_MAP_DEFAULT = "READ,READ,READ,READ";
+
 namespace ycsbc
 {
+
+  std::vector<std::string> Prop2vector(const utils::Properties &props, const std::string &prop, const std::string &default_val)
+  {
+    std::string vals = props.GetProperty(prop, default_val);
+    std::vector<std::string> output;
+    std::string val;
+
+    std::istringstream stream(vals);
+    while (std::getline(stream, val, ','))
+    {
+      output.push_back(val);
+    }
+    return output;
+  }
+
+  Operation stringToOperation(const std::string &operationName)
+  {
+    static const std::unordered_map<std::string, Operation> operationMap = {
+        {"INSERT", INSERT},
+        {"READ", READ},
+        {"UPDATE", UPDATE},
+        {"SCAN", SCAN},
+        {"READMODIFYWRITE", READMODIFYWRITE},
+        {"DELETE", DELETE},
+        {"RANDOM_INSERT", RANDOM_INSERT},
+        {"INSERT_BATCH", INSERT_BATCH},
+        {"INSERT_FAILED", INSERT_FAILED},
+        {"READ_FAILED", READ_FAILED},
+        {"UPDATE_FAILED", UPDATE_FAILED},
+        {"SCAN_FAILED", SCAN_FAILED},
+        {"READMODIFYWRITE_FAILED", READMODIFYWRITE_FAILED},
+        {"DELETE_FAILED", DELETE_FAILED},
+        {"INSERT_BATCH_FAILED", INSERT_BATCH_FAILED},
+        {"MAXOPTYPE", MAXOPTYPE}};
+
+    auto it = operationMap.find(operationName);
+    if (it != operationMap.end())
+    {
+      return it->second;
+    }
+    else
+    {
+      throw std::invalid_argument("Invalid operation name: " + operationName);
+    }
+  }
 
   void CoreWorkload::Init(const utils::Properties &p)
   {
     table_name_ = p.GetProperty(TABLENAME_PROPERTY, TABLENAME_DEFAULT);
     op_mode_real_ = p.GetProperty(OP_MODE_PROPERTY, OP_MODE_DEFAULT) == "true";
+
+    client_to_cf_ = Prop2vector(p, CLIENT_TO_CF_MAP, CLIENT_TO_CF_MAP_DEFAULT);
+
+    std::vector<std::string> client_to_op_string = Prop2vector(p, CLIENT_TO_OP_MAP, CLIENT_TO_OP_MAP_DEFAULT);
+    for (const auto &op_string : client_to_op_string)
+    {
+      client_to_op_.push_back(stringToOperation(op_string));
+    }
+
+    // const size_t num_threads = std::stoi(p.GetProperty("threadcount", "1"));
+    // if (num_threads != client_to_op_.size() || num_threads != client_to_cf_.size()) {
+    //   throw utils::Exception("Inconsistent thread counts and thread to CF and OP mappings");
+    // }
 
     field_count_ = std::stoi(p.GetProperty(FIELD_COUNT_PROPERTY, FIELD_COUNT_DEFAULT));
     field_prefix_ = p.GetProperty(FIELD_NAME_PREFIX, FIELD_NAME_PREFIX_DEFAULT);
@@ -197,12 +261,12 @@ namespace ycsbc
 
     if (request_dist == "uniform")
     {
-      std::cout << "[YCSB] Uniform distribution." << std::endl;
+      std::cout << "[FAIRDB_LOG] Uniform distribution." << std::endl;
       key_chooser_ = new UniformGenerator(0, record_count_ - 1);
     }
     else if (request_dist == "zipfian")
     {
-      std::cout << "[YCSB] Zipfian distribution." << std::endl;
+      std::cout << "[FAIRDB_LOG] Zipfian distribution." << std::endl;
       // If the number of keys changes, we don't want to change popular keys.
       // So we construct the scrambled zipfian generator with a keyspace
       // that is larger than what exists at the beginning of the test.
@@ -220,74 +284,63 @@ namespace ycsbc
         key_chooser_ = new ScrambledZipfianGenerator(record_count_ + new_keys);
       }
     }
-    else if (request_dist == "latest")
+
+    ycsbc::Generator<uint64_t> *CoreWorkload::GetFieldLenGenerator(
+        const utils::Properties &p)
     {
-      key_chooser_ = new SkewedLatestGenerator(*transaction_insert_key_sequence_);
-    }
-    else
-    {
-      throw utils::Exception("Unknown request distribution: " + request_dist);
+      string field_len_dist = p.GetProperty(FIELD_LENGTH_DISTRIBUTION_PROPERTY,
+                                            FIELD_LENGTH_DISTRIBUTION_DEFAULT);
+      int field_len = std::stoi(p.GetProperty(FIELD_LENGTH_PROPERTY, FIELD_LENGTH_DEFAULT));
+      if (field_len_dist == "constant")
+      {
+        return new ConstGenerator(field_len);
+      }
+      else if (field_len_dist == "uniform")
+      {
+        return new UniformGenerator(1, field_len);
+      }
+      else if (field_len_dist == "zipfian")
+      {
+        return new ZipfianGenerator(1, field_len);
+      }
+      else
+      {
+        throw utils::Exception("Unknown field length distribution: " + field_len_dist);
+      }
     }
 
-    field_chooser_ = new UniformGenerator(0, field_count_ - 1);
+    std::string CoreWorkload::BuildKeyName(uint64_t key_num)
+    {
+      // if (!ordered_inserts_) {
+      //   key_num = utils::Hash(key_num);
+      // }
+      std::string prekey = "user";
+      std::string value = std::to_string(key_num);
+      // int fill = std::max(0, zero_padding_ - static_cast<int>(value.size()));
+      // return prekey.append(fill, '0').append(value);
+      return prekey.append(value);
+    }
 
-    if (scan_len_dist == "uniform")
+    void CoreWorkload::BuildValues(std::vector<ycsbc::DB::Field> & values)
     {
-      scan_len_chooser_ = new UniformGenerator(min_scan_len, max_scan_len);
+      for (int i = 0; i < field_count_; ++i)
+      {
+        values.push_back(DB::Field());
+        ycsbc::DB::Field &field = values.back();
+        field.name.append(field_prefix_).append(std::to_string(i));
+        uint64_t len = field_len_generator_->Next();
+        field.value.reserve(len);
+        RandomByteGenerator byte_generator;
+        std::generate_n(std::back_inserter(field.value), len, [&]()
+                        { return byte_generator.Next(); });
+      }
     }
-    else if (scan_len_dist == "zipfian")
-    {
-      scan_len_chooser_ = new ZipfianGenerator(min_scan_len, max_scan_len);
-    }
-    else
-    {
-      throw utils::Exception("Distribution not allowed for scan length: " + scan_len_dist);
-    }
-  }
 
-  ycsbc::Generator<uint64_t> *CoreWorkload::GetFieldLenGenerator(
-      const utils::Properties &p)
-  {
-    string field_len_dist = p.GetProperty(FIELD_LENGTH_DISTRIBUTION_PROPERTY,
-                                          FIELD_LENGTH_DISTRIBUTION_DEFAULT);
-    int field_len = std::stoi(p.GetProperty(FIELD_LENGTH_PROPERTY, FIELD_LENGTH_DEFAULT));
-    if (field_len_dist == "constant")
-    {
-      return new ConstGenerator(field_len);
-    }
-    else if (field_len_dist == "uniform")
-    {
-      return new UniformGenerator(1, field_len);
-    }
-    else if (field_len_dist == "zipfian")
-    {
-      return new ZipfianGenerator(1, field_len);
-    }
-    else
-    {
-      throw utils::Exception("Unknown field length distribution: " + field_len_dist);
-    }
-  }
-
-  std::string CoreWorkload::BuildKeyName(uint64_t key_num)
-  {
-    // if (!ordered_inserts_) {
-    //   key_num = utils::Hash(key_num);
-    // }
-    std::string prekey = "user";
-    std::string value = std::to_string(key_num);
-    // int fill = std::max(0, zero_padding_ - static_cast<int>(value.size()));
-    // return prekey.append(fill, '0').append(value);
-    return prekey.append(value);
-  }
-
-  void CoreWorkload::BuildValues(std::vector<ycsbc::DB::Field> &values)
-  {
-    for (int i = 0; i < field_count_; ++i)
+    void CoreWorkload::BuildSingleValue(std::vector<ycsbc::DB::Field> & values)
     {
       values.push_back(DB::Field());
       ycsbc::DB::Field &field = values.back();
-      field.name.append(field_prefix_).append(std::to_string(i));
+      field.name.append(NextFieldName());
       uint64_t len = field_len_generator_->Next();
       field.value.reserve(len);
       RandomByteGenerator byte_generator;
@@ -318,18 +371,6 @@ namespace ycsbc
     return key_num;
   }
 
-  uint64_t CoreWorkload::NextTransactionKeyNumUnique()
-  {
-    uint64_t key_num;
-    do
-    {
-      key_num = key_chooser_->Next();
-    } while (key_num > transaction_insert_key_sequence_->Last() || used_keys.count(key_num) > 0);
-
-    used_keys.insert(key_num); // Mark this key as used
-    return key_num;
-  }
-
   std::string CoreWorkload::NextFieldName()
   {
     return std::string(field_prefix_).append(std::to_string(field_chooser_->Next()));
@@ -343,35 +384,103 @@ namespace ycsbc
     return db.Insert(table_name_, key, fields) == DB::kOK;
   }
 
-  bool CoreWorkload::DoTransaction(DB &db, int client_id, long long start_time_ns)
+  bool CoreWorkload::DoTransaction(DB &db, int client_id)
   {
+    std::string table_name = client_to_cf_[client_id];
 
-    // std::string table_name = rocksdb::kDefaultColumnFamilyName;
-    std::string table_name;
-    if (client_id == 0)
+    uint64_t CoreWorkload::NextTransactionKeyNum()
     {
-      table_name = rocksdb::kDefaultColumnFamilyName;
-    }
-    else if (client_id == 1)
-    {
-      table_name = "cf2";
-    }
-    else if (client_id == 2)
-    {
-      table_name = "cf3";
-    }
-    else if (client_id == 3)
-    {
-      table_name = "cf4";
+      uint64_t key_num;
+      do
+      {
+        key_num = key_chooser_->Next();
+      } while (key_num > transaction_insert_key_sequence_->Last());
+      return key_num;
     }
 
-    // std::cout << "[YCSB] Table name: " << table_name << std::endl;
-
-    DB::Status status;
-    if (op_mode_real_)
+    uint64_t CoreWorkload::NextTransactionKeyNumUnique()
     {
-      auto op_choice = op_chooser_.Next();
-      switch (op_choice)
+      uint64_t key_num;
+      do
+      {
+        key_num = key_chooser_->Next();
+      } while (key_num > transaction_insert_key_sequence_->Last() || used_keys.count(key_num) > 0);
+
+      used_keys.insert(key_num); // Mark this key as used
+      return key_num;
+    }
+
+    std::string CoreWorkload::NextFieldName()
+    {
+      return std::string(field_prefix_).append(std::to_string(field_chooser_->Next()));
+    }
+
+    bool CoreWorkload::DoInsert(DB & db)
+    {
+      const std::string key = BuildKeyName(insert_key_sequence_->Next());
+      std::vector<DB::Field> fields;
+      BuildValues(fields);
+      return db.Insert(table_name_, key, fields) == DB::kOK;
+    }
+
+    bool CoreWorkload::DoTransaction(DB & db, int client_id, long long start_time_ns)
+    {
+
+      // std::string table_name = rocksdb::kDefaultColumnFamilyName;
+      std::string table_name;
+      if (client_id == 0)
+      {
+        table_name = rocksdb::kDefaultColumnFamilyName;
+      }
+      else if (client_id == 1)
+      {
+        table_name = "cf2";
+      }
+      else if (client_id == 2)
+      {
+        table_name = "cf3";
+      }
+      else if (client_id == 3)
+      {
+        table_name = "cf4";
+      }
+
+      // std::cout << "[YCSB] Table name: " << table_name << std::endl;
+
+      DB::Status status;
+      if (op_mode_real_)
+      {
+        auto op_choice = op_chooser_.Next();
+        switch (op_choice)
+        {
+        case READ:
+          status = TransactionRead(db, client_id, table_name);
+          break;
+        case UPDATE:
+          status = TransactionUpdate(db, client_id, table_name);
+          break;
+        case INSERT:
+          status = TransactionInsert(db);
+          break;
+        case SCAN:
+          status = TransactionScan(db, client_id, table_name);
+          break;
+        case READMODIFYWRITE:
+          status = TransactionReadModifyWrite(db);
+          break;
+        case RANDOM_INSERT:
+          status = TransactionRandomInsert(db, client_id, table_name, start_time_ns);
+          break;
+        default:
+          std::cout << "[YCSB] Unknown op: " << op_choice << std::endl;
+          throw utils::Exception("Operation request is not recognized!");
+        }
+      }
+    }
+    else
+    {
+      Operation op = client_to_op_[client_id];
+      switch (op)
       {
       case READ:
         status = TransactionRead(db, client_id, table_name);
@@ -392,160 +501,117 @@ namespace ycsbc
         status = TransactionRandomInsert(db, client_id, table_name, start_time_ns);
         break;
       default:
-        std::cout << "[YCSB] Unknown op: " << op_choice << std::endl;
+        std::cout << "[FAIRDB_LOG] Unknown op: " << op << std::endl;
         throw utils::Exception("Operation request is not recognized!");
       }
     }
-    else
+
+    DB::Status CoreWorkload::TransactionReadModifyWrite(DB & db)
     {
-      if (client_id == 0)
+      uint64_t key_num = NextTransactionKeyNum();
+      const std::string key = BuildKeyName(key_num);
+      std::vector<DB::Field> result;
+
+      if (!read_all_fields())
       {
-        status = TransactionRandomInsert(db, client_id, table_name, start_time_ns);
-      }
-      else if (client_id == 1)
-      {
-        status = TransactionRandomInsert(db, client_id, table_name, start_time_ns);
-      }
-      else if (client_id == 2)
-      {
-        status = TransactionRandomInsert(db, client_id, table_name, start_time_ns);
+        std::vector<std::string> fields;
+        fields.push_back(NextFieldName());
+        db.Read(table_name_, key, &fields, result);
       }
       else
       {
-        status = TransactionRandomInsert(db, client_id, table_name, start_time_ns);
+        db.Read(table_name_, key, NULL, result);
+      }
+
+      std::vector<DB::Field> values;
+      if (write_all_fields())
+      {
+        BuildValues(values);
+      }
+      else
+      {
+        BuildSingleValue(values);
+      }
+      return db.Update(table_name_, key, values);
+    }
+
+    DB::Status CoreWorkload::TransactionScan(DB & db, int client_id, std::string table_name)
+    {
+      uint64_t key_num = NextTransactionKeyNum();
+      int len = 100;
+      uint64_t client_key_num = std::min(key_num, uint64_t(3125000 - len));
+      // uint64_t client_key_num = key_num + (client_id%2) * (6250000 / 4);
+
+      const std::string key = BuildKeyName(client_key_num);
+      // int len = scan_len_chooser_->Next();
+      std::vector<std::vector<DB::Field>> result;
+      if (!read_all_fields())
+      {
+        std::vector<std::string> fields;
+        fields.push_back(NextFieldName());
+        return db.Scan(table_name, key, len, &fields, result, client_id);
+      }
+      else
+      {
+        return db.Scan(table_name, key, len, NULL, result, client_id);
       }
     }
 
-    return (status == DB::kOK);
-  }
-
-  DB::Status CoreWorkload::TransactionRead(DB &db, int client_id, std::string table_name)
-  {
-    uint64_t key_num = NextTransactionKeyNum();
-
-    uint64_t client_key_num = key_num;
-    // uint64_t client_key_num = key_num + (client_id%2) * (6250000 / 4);
-
-    const std::string key = BuildKeyName(client_key_num);
-    std::vector<DB::Field> result;
-    if (!read_all_fields())
+    DB::Status CoreWorkload::TransactionUpdate(DB & db, int client_id, std::string table_name)
     {
-      std::vector<std::string> fields;
-      fields.push_back(NextFieldName());
-      return db.Read(table_name, key, &fields, result, client_id);
-    }
-    else
-    {
-      return db.Read(table_name, key, NULL, result, client_id);
-    }
-  }
+      uint64_t key_num = NextTransactionKeyNum();
+      // For multi-cf
+      uint64_t client_key_num = key_num;
+      // uint64_t client_key_num = key_num + (client_id) * (6250000 / 4);
 
-  DB::Status CoreWorkload::TransactionReadModifyWrite(DB &db)
-  {
-    uint64_t key_num = NextTransactionKeyNum();
-    const std::string key = BuildKeyName(key_num);
-    std::vector<DB::Field> result;
-
-    if (!read_all_fields())
-    {
-      std::vector<std::string> fields;
-      fields.push_back(NextFieldName());
-      db.Read(table_name_, key, &fields, result);
-    }
-    else
-    {
-      db.Read(table_name_, key, NULL, result);
+      const std::string key = BuildKeyName(client_key_num);
+      std::vector<DB::Field> values;
+      if (write_all_fields())
+      {
+        BuildValues(values);
+      }
+      else
+      {
+        BuildSingleValue(values);
+      }
+      return db.Update(table_name, key, values, client_id);
     }
 
-    std::vector<DB::Field> values;
-    if (write_all_fields())
+    DB::Status CoreWorkload::TransactionRandomInsert(DB & db, int client_id, std::string table_name, long long start_time_ns)
     {
+      uint64_t key_num = NextTransactionKeyNumUnique();
+      uint64_t client_key_num = key_num;
+
+      const std::string key = BuildKeyName(client_key_num);
+      // std::cout << "[YCSB] Inserting key: " << key << std::endl;
+      std::vector<DB::Field> values;
       BuildValues(values);
+      return db.Insert(table_name, key, values, start_time_ns, client_id);
     }
-    else
-    {
-      BuildSingleValue(values);
-    }
-    return db.Update(table_name_, key, values);
-  }
 
-  DB::Status CoreWorkload::TransactionScan(DB &db, int client_id, std::string table_name)
-  {
-    uint64_t key_num = NextTransactionKeyNum();
-    int len = 100;
-    uint64_t client_key_num = std::min(key_num, uint64_t(3125000 - len));
-    // uint64_t client_key_num = key_num + (client_id%2) * (6250000 / 4);
-
-    const std::string key = BuildKeyName(client_key_num);
-    // int len = scan_len_chooser_->Next();
-    std::vector<std::vector<DB::Field>> result;
-    if (!read_all_fields())
+    DB::Status CoreWorkload::TransactionInsertBatch(DB & db, int client_id, std::string table_name)
     {
-      std::vector<std::string> fields;
-      fields.push_back(NextFieldName());
-      return db.Scan(table_name, key, len, &fields, result, client_id);
-    }
-    else
-    {
-      return db.Scan(table_name, key, len, NULL, result, client_id);
-    }
-  }
+      uint64_t key_num = NextTransactionKeyNum();
+      // uint64_t key_num = transaction_insert_key_sequence_->Next();
+      int batch_size = 600;
+      uint64_t client_key_num = key_num;
+      client_key_num = std::min(key_num, uint64_t(3125000 - batch_size));
 
-  DB::Status CoreWorkload::TransactionUpdate(DB &db, int client_id, std::string table_name)
-  {
-    uint64_t key_num = NextTransactionKeyNum();
-    // For multi-cf
-    uint64_t client_key_num = key_num;
-    // uint64_t client_key_num = key_num + (client_id) * (6250000 / 4);
-
-    const std::string key = BuildKeyName(client_key_num);
-    std::vector<DB::Field> values;
-    if (write_all_fields())
-    {
+      // const std::string key = BuildKeyName(client_key_num);
+      std::vector<DB::Field> values;
       BuildValues(values);
+      return db.InsertBatch(table_name, client_key_num, values, batch_size, client_id);
     }
-    else
+
+    DB::Status CoreWorkload::TransactionInsert(DB & db)
     {
-      BuildSingleValue(values);
+      uint64_t key_num = transaction_insert_key_sequence_->Next();
+      const std::string key = BuildKeyName(key_num);
+      std::vector<DB::Field> values;
+      BuildValues(values);
+      DB::Status s = db.Insert(table_name_, key, values);
+      transaction_insert_key_sequence_->Acknowledge(key_num);
+      return s;
     }
-    return db.Update(table_name, key, values, client_id);
-  }
 
-  DB::Status CoreWorkload::TransactionRandomInsert(DB &db, int client_id, std::string table_name, long long start_time_ns)
-  {
-    uint64_t key_num = NextTransactionKeyNumUnique();
-    uint64_t client_key_num = key_num;
-
-    const std::string key = BuildKeyName(client_key_num);
-    // std::cout << "[YCSB] Inserting key: " << key << std::endl;
-    std::vector<DB::Field> values;
-    BuildValues(values);
-    return db.Insert(table_name, key, values, start_time_ns, client_id);
-  }
-
-  DB::Status CoreWorkload::TransactionInsertBatch(DB &db, int client_id, std::string table_name)
-  {
-    uint64_t key_num = NextTransactionKeyNum();
-    // uint64_t key_num = transaction_insert_key_sequence_->Next();
-    int batch_size = 600;
-    uint64_t client_key_num = key_num;
-    client_key_num = std::min(key_num, uint64_t(3125000 - batch_size));
-
-    // const std::string key = BuildKeyName(client_key_num);
-    std::vector<DB::Field> values;
-    BuildValues(values);
-    return db.InsertBatch(table_name, client_key_num, values, batch_size, client_id);
-  }
-
-  DB::Status CoreWorkload::TransactionInsert(DB &db)
-  {
-    uint64_t key_num = transaction_insert_key_sequence_->Next();
-    const std::string key = BuildKeyName(key_num);
-    std::vector<DB::Field> values;
-    BuildValues(values);
-    DB::Status s = db.Insert(table_name_, key, values);
-    transaction_insert_key_sequence_->Acknowledge(key_num);
-    return s;
-  }
-
-} // ycsbc
+  } // ycsbc

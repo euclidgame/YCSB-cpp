@@ -43,6 +43,9 @@ namespace
   const std::string PROP_COMPRESSION = "rocksdb.compression";
   const std::string PROP_COMPRESSION_DEFAULT = "no";
 
+  const std::string PROP_NUM_CFS = "rocksdb.num_cfs";
+  const std::string PROP_NUM_CFS_DEFAULT = "1";
+
   const std::string PROP_MAX_BG_JOBS = "rocksdb.max_background_jobs";
   const std::string PROP_MAX_BG_JOBS_DEFAULT = "0";
 
@@ -841,14 +844,36 @@ namespace ycsbc
     return kOK;
   }
 
-  DB::Status RocksdbDB::InsertSingle(const std::string &table, const std::string &key,
-                                     std::vector<Field> &values)
-  {
-    auto *handle = table2handle(table);
-    if (handle == nullptr)
-    {
-      std::cout << "[YCSB] Bad table/handle: " << table << std::endl;
-      return kError;
+  rocksdb::Options opt;
+  opt.create_if_missing = true;
+  opt.create_missing_column_families = true;
+  std::vector<rocksdb::ColumnFamilyDescriptor> cf_descs;
+  GetOptions(props, &opt, &cf_descs);
+
+  std::vector<rocksdb::ColumnFamilyOptions> cf_opts;
+  const int num_cfs = std::stoi(props.GetProperty(PROP_NUM_CFS, PROP_NUM_CFS_DEFAULT));
+  for (int i = 0; i < num_cfs; ++i) {
+    cf_opts.push_back(rocksdb::ColumnFamilyOptions());
+  }
+  GetCfOptions(props, cf_opts);
+  for (int i = 0; i < num_cfs; ++i) {
+    std::string cf_name;
+    if (i == 0) {
+      cf_name = rocksdb::kDefaultColumnFamilyName;
+    } else {
+      cf_name = "cf" + std::to_string(i+1);
+    }
+    cf_descs.emplace_back(cf_name, cf_opts[i]);
+    std::cout << "[FAIRDB_LOG] Init column family: " << cf_name << std::endl;
+  }
+
+  opt.statistics = rocksdb::CreateDBStatistics();
+
+  rocksdb::Status s;
+  if (props.GetProperty(PROP_DESTROY, PROP_DESTROY_DEFAULT) == "true") {
+    s = rocksdb::DestroyDB(db_path, opt);
+    if (!s.ok()) {
+      throw utils::Exception(std::string("RocksDB DestroyDB: ") + s.ToString());
     }
 
     std::string data;
