@@ -426,7 +426,7 @@ namespace ycsbc
       val = std::stoi(props.GetProperty(PROP_WRITE_BUFFER_SIZE, PROP_WRITE_BUFFER_SIZE_DEFAULT));
       if (val != 0)
       {
-        std::cout << "TGRIGGS_LOG write buffer size: " << val << std::endl;
+        std::cout << "[YCSB] write buffer size: " << val << std::endl;
         opt->write_buffer_size = val;
       }
       val = std::stoi(props.GetProperty(PROP_MAX_WRITE_BUFFER, PROP_MAX_WRITE_BUFFER_DEFAULT));
@@ -549,8 +549,10 @@ namespace ycsbc
   void RocksdbDB::GetCfOptions(const utils::Properties &props, std::vector<rocksdb::ColumnFamilyOptions> &cf_opt)
   {
     std::vector<std::string> vals = Prop2vector(props, PROP_MAX_WRITE_BUFFER, PROP_MAX_WRITE_BUFFER_DEFAULT);
+    std::cout << "[YCSB] max_write_buffer_number: " << vals[0] << std::endl;
     for (size_t i = 0; i < cf_opt.size(); ++i)
     {
+      std::cout << vals[i] << std::endl;
       cf_opt[i].max_write_buffer_number = std::stoi(vals[i]);
       cf_opt[i].soft_pending_compaction_bytes_limit = static_cast<uint64_t>(128) * 1024 * 1024 * 1024; // 128GB
       cf_opt[i].hard_pending_compaction_bytes_limit = static_cast<uint64_t>(256) * 1024 * 1024 * 1024; // 256GB
@@ -560,17 +562,21 @@ namespace ycsbc
       cf_opt[i].level0_stop_writes_trigger = 1000;
       // cf_opt[i].max_write_buffer_number_to_maintain = 4;
     }
+    std::cout << "Here\n";
     vals = Prop2vector(props, PROP_WRITE_BUFFER_SIZE, PROP_WRITE_BUFFER_SIZE_DEFAULT);
+    std::cout << "[YCSB] write_buffer_size: " << vals[0] << std::endl;
     for (size_t i = 0; i < cf_opt.size(); ++i)
     {
       cf_opt[i].write_buffer_size = std::stoi(vals[i]);
     }
     vals = Prop2vector(props, PROP_MIN_MEMTABLE_TO_MERGE, PROP_MIN_MEMTABLE_TO_MERGE_DEFAULT);
+    std::cout << "[YCSB] min_write_buffer_number_to_merge: " << vals[0] << std::endl;
     for (size_t i = 0; i < cf_opt.size(); ++i)
     {
       cf_opt[i].min_write_buffer_number_to_merge = std::stoi(vals[i]);
     }
     vals = Prop2vector(props, PROP_CACHE_SIZE, PROP_CACHE_SIZE_DEFAULT);
+    std::cout << "[YCSB] cache_size: " << vals[0] << std::endl;
     for (size_t i = 0; i < cf_opt.size(); ++i)
     {
       rocksdb::BlockBasedTableOptions table_options;
@@ -587,10 +593,15 @@ namespace ycsbc
       cf_opt[i].table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
     }
     vals = Prop2vector(props, PROP_NUM_LEVELS, PROP_NUM_LEVELS_DEFAULT);
+    std::cout << "[YCSB] num_levels: " << vals[0] << std::endl;
+    std::cout << vals.size() << std::endl;
     for (size_t i = 0; i < cf_opt.size(); ++i)
     {
+      std::cout << i << ": " << vals[i] << std::endl;
       cf_opt[i].num_levels = std::stoi(vals[i]);
+      std::cout << "num_levels: " << cf_opt[i].num_levels << std::endl;
     }
+    std::cout << "GetCfOptions done\n";
   }
 
   void RocksdbDB::SerializeRow(const std::vector<Field> &values, std::string &data)
@@ -697,7 +708,7 @@ namespace ycsbc
     auto *handle = table2handle(table);
     if (handle == nullptr)
     {
-      std::cout << "[TGRIGGS_LOG] Bad table/handle: " << table << std::endl;
+      std::cout << "[YCSB] Bad table/handle: " << table << std::endl;
       return kError;
     }
 
