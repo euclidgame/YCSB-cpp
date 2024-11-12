@@ -698,7 +698,7 @@ namespace ycsbc
     {
       return nullptr;
     }
-    assert(cf_idx < cf_handles_.size());
+    assert(((size_t)cf_idx) < cf_handles_.size());
     return cf_handles_[cf_idx];
   }
 
